@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate, useParams, useSearch } from '@tanstack/react-router'
+import { createFileRoute, useBlocker, useNavigate, useParams, useSearch } from '@tanstack/react-router'
 import { createServerFn, useServerFn } from '@tanstack/react-start'
 import {
   Check,
@@ -145,6 +145,7 @@ const ICON_OPTIONS: EmojiOption[] = [
   { unicode: '🌍', label: 'globe' },
   { unicode: '🏁', label: 'flag' },
 ]
+const COVER_RESULT_SKELETON_IDS = ['a', 'b', 'c', 'd', 'e', 'f']
 
 const listFilesServerFn = createServerFn({ method: 'GET' })
   .inputValidator((input: { target: RepoTargetInput }) => input)
@@ -383,15 +384,20 @@ export function App() {
   )
 
   const setSelectedPathAndUrl = (nextPath: string | null, replace = false) => {
-    setSelectedPath(nextPath)
-    const nextUrl = buildEditorUrl({
-      owner,
-      repo,
-      branch,
-      rootPath,
-      filePath: nextPath,
+    const search = {
+      ...(rootPath ? { root: rootPath } : {}),
+      ...(nextPath ? { file: nextPath } : {}),
+    }
+    void navigate({
+      to: '/$owner/$repo/$branch',
+      params: {
+        owner,
+        repo,
+        branch,
+      },
+      search,
+      replace,
     })
-    void navigate({ to: nextUrl as any, replace })
   }
 
   const tree = useMemo(() => buildTree(files), [files])
@@ -490,6 +496,20 @@ export function App() {
     !titleMissing &&
     isDirty
 
+  useEffect(() => {
+    if (!selectedPath) return
+    expandParents(selectedPath, setExpandedFolders)
+  }, [selectedPath])
+
+  useBlocker({
+    shouldBlockFn: () => {
+      if (!isDirty || isSaving) return false
+      if (typeof window === 'undefined') return true
+      return !window.confirm('You have unsaved changes. Leave this page without saving?')
+    },
+    enableBeforeUnload: isDirty,
+  })
+
   const repoUrl = `https://github.com/${owner}/${repo}/tree/${branch}${rootPath ? `/${rootPath}` : ''}`
   const commitsUrl = `https://github.com/${owner}/${repo}/commits/${branch}`
   const fileUrl = selectedPath
@@ -566,14 +586,14 @@ export function App() {
   }, [filePathFromUrl])
 
   useEffect(() => {
-    // Backward compatibility: migrate legacy ?file=... links to path-based URLs.
-    if (!filePathFromSearch || filePathFromRoute) return
-    setSelectedPathAndUrl(filePathFromSearch, true)
-  }, [filePathFromRoute, filePathFromSearch])
+    // Normalize path-based links to query-based URL so route component state is preserved.
+    if (!filePathFromRoute) return
+    setSelectedPathAndUrl(filePathFromRoute, true)
+  }, [filePathFromRoute])
 
   useEffect(() => {
     setFiles([])
-    setSelectedPathAndUrl(null, true)
+    setSelectedPath(filePathFromUrl)
     setTitle('')
     setBody('')
     setIcon('')
@@ -593,7 +613,7 @@ export function App() {
   useEffect(() => {
     if (!isAuthenticated) {
       setFiles([])
-      setSelectedPathAndUrl(null, true)
+      setSelectedPath(filePathFromUrl)
       setIsLoadingRepo(false)
       return
     }
@@ -1706,32 +1726,38 @@ export function App() {
                         </PopoverTrigger>
                         <PopoverContent className="w-[30rem] p-2" align="end" sideOffset={8}>
                           <div className="space-y-2">
-                            <Input
-                              value={coverQuery}
-                              onChange={(event) => setCoverQuery(event.target.value)}
-                              placeholder="Search Pexels"
-                              className="h-7"
-                            />
-                            <div className="grid grid-cols-2 gap-2">
-                              {coverResults.map((item) => (
-                                <button
-                                  key={item.id}
-                                  type="button"
-                                  className="group/image relative overflow-hidden rounded-md border text-left"
-                                  onClick={() => handleSetCover(item.fullUrl)}
-                                  title={item.alt}
-                                >
-                                  <img
-                                    src={item.previewUrl}
-                                    alt={item.alt}
-                                    className="h-24 w-full object-cover transition-transform group-hover/image:scale-[1.02]"
-                                  />
-                                </button>
-                              ))}
+                            <div className="relative">
+                              <Input
+                                value={coverQuery}
+                                onChange={(event) => setCoverQuery(event.target.value)}
+                                placeholder="Search Pexels"
+                                className="h-7 pr-8"
+                              />
+                              {isCoverSearchLoading ? (
+                                <Loader2 className="pointer-events-none absolute top-1/2 right-2 size-3.5 -translate-y-1/2 animate-spin text-muted-foreground" />
+                              ) : null}
                             </div>
-                            {isCoverSearchLoading ? (
-                              <p className="text-xs text-muted-foreground">Searching Pexels…</p>
-                            ) : null}
+                            <div className="grid grid-cols-2 gap-2">
+                              {isCoverSearchLoading
+                                ? COVER_RESULT_SKELETON_IDS.map((id) => (
+                                    <Skeleton key={`cover-result-skeleton-${id}`} className="h-24 w-full rounded-md" />
+                                  ))
+                                : coverResults.map((item) => (
+                                    <button
+                                      key={item.id}
+                                      type="button"
+                                      className="group/image relative overflow-hidden rounded-md border text-left"
+                                      onClick={() => handleSetCover(item.fullUrl)}
+                                      title={item.alt}
+                                    >
+                                      <img
+                                        src={item.previewUrl}
+                                        alt={item.alt}
+                                        className="h-24 w-full object-cover transition-transform group-hover/image:scale-[1.02]"
+                                      />
+                                    </button>
+                                  ))}
+                            </div>
                             {!isCoverSearchLoading && coverSearchError ? (
                               <p className="text-xs text-destructive">{coverSearchError}</p>
                             ) : null}
@@ -1895,32 +1921,38 @@ export function App() {
                         </PopoverTrigger>
                         <PopoverContent className="w-[30rem] p-2" align="start" sideOffset={8}>
                           <div className="space-y-2">
-                            <Input
-                              value={coverQuery}
-                              onChange={(event) => setCoverQuery(event.target.value)}
-                              placeholder="Search Pexels"
-                              className="h-7"
-                            />
-                            <div className="grid grid-cols-2 gap-2">
-                              {coverResults.map((item) => (
-                                <button
-                                  key={item.id}
-                                  type="button"
-                                  className="group/image relative overflow-hidden rounded-md border text-left"
-                                  onClick={() => handleSetCover(item.fullUrl)}
-                                  title={item.alt}
-                                >
-                                  <img
-                                    src={item.previewUrl}
-                                    alt={item.alt}
-                                    className="h-24 w-full object-cover transition-transform group-hover/image:scale-[1.02]"
-                                  />
-                                </button>
-                              ))}
+                            <div className="relative">
+                              <Input
+                                value={coverQuery}
+                                onChange={(event) => setCoverQuery(event.target.value)}
+                                placeholder="Search Pexels"
+                                className="h-7 pr-8"
+                              />
+                              {isCoverSearchLoading ? (
+                                <Loader2 className="pointer-events-none absolute top-1/2 right-2 size-3.5 -translate-y-1/2 animate-spin text-muted-foreground" />
+                              ) : null}
                             </div>
-                            {isCoverSearchLoading ? (
-                              <p className="text-xs text-muted-foreground">Searching Pexels…</p>
-                            ) : null}
+                            <div className="grid grid-cols-2 gap-2">
+                              {isCoverSearchLoading
+                                ? COVER_RESULT_SKELETON_IDS.map((id) => (
+                                    <Skeleton key={`cover-result-skeleton-${id}`} className="h-24 w-full rounded-md" />
+                                  ))
+                                : coverResults.map((item) => (
+                                    <button
+                                      key={item.id}
+                                      type="button"
+                                      className="group/image relative overflow-hidden rounded-md border text-left"
+                                      onClick={() => handleSetCover(item.fullUrl)}
+                                      title={item.alt}
+                                    >
+                                      <img
+                                        src={item.previewUrl}
+                                        alt={item.alt}
+                                        className="h-24 w-full object-cover transition-transform group-hover/image:scale-[1.02]"
+                                      />
+                                    </button>
+                                  ))}
+                            </div>
                             {!isCoverSearchLoading && coverSearchError ? (
                               <p className="text-xs text-destructive">{coverSearchError}</p>
                             ) : null}
@@ -2070,7 +2102,11 @@ function renderFolderNode(args: {
           onClick={() => {
             onSelectFile(file.path)
             const subfolder = subfolderByParentFilePath.get(file.path)
-            if (subfolder && !expandedFolders.has(subfolder.path)) {
+            if (
+              subfolder &&
+              !isFolderAutoExpandedBySelection(subfolder.path, selectedPath) &&
+              !expandedFolders.has(subfolder.path)
+            ) {
               onToggleFolder(subfolder.path)
             }
           }}
@@ -2098,7 +2134,11 @@ function renderFolderNode(args: {
                 data-tree-icon="chevron"
                 className="absolute inset-0 inline-flex items-center justify-center opacity-0 transition-opacity"
               >
-                {expandedFolders.has(subfolderByParentFilePath.get(file.path)?.path ?? '') ? (
+                {isFolderExpanded(
+                  subfolderByParentFilePath.get(file.path)?.path ?? '',
+                  selectedPath,
+                  expandedFolders,
+                ) ? (
                   <ChevronDown className="size-3.5 text-muted-foreground" />
                 ) : (
                   <ChevronRight className="size-3.5 text-muted-foreground" />
@@ -2145,7 +2185,7 @@ function renderFolderNode(args: {
         </DropdownMenu>
         {(() => {
           const subfolder = subfolderByParentFilePath.get(file.path)
-          if (!subfolder || !expandedFolders.has(subfolder.path)) return null
+          if (!subfolder || !isFolderExpanded(subfolder.path, selectedPath, expandedFolders)) return null
           return (
             <SidebarMenuSub className="mr-0 pr-0">
               {renderFolderNode({
@@ -2173,7 +2213,7 @@ function renderFolderNode(args: {
     .map((subfolder) => {
       const parentFilePath = `${subfolder.path}.md`
       const parentFileExists = fileMap.has(parentFilePath)
-      const isExpanded = expandedFolders.has(subfolder.path)
+      const isExpanded = isFolderExpanded(subfolder.path, selectedPath, expandedFolders)
       const hasVisibleChild = hasMatchingChild(subfolder, searchTerm)
 
       if (parentFileExists || !hasVisibleChild) {
@@ -2395,6 +2435,19 @@ function expandParents(
   })
 }
 
+function isFolderAutoExpandedBySelection(folderPath: string, selectedPath: string | null): boolean {
+  if (!selectedPath || !folderPath) return false
+  return selectedPath === `${folderPath}.md` || selectedPath.startsWith(`${folderPath}/`)
+}
+
+function isFolderExpanded(
+  folderPath: string,
+  selectedPath: string | null,
+  expandedFolders: Set<string>,
+): boolean {
+  return expandedFolders.has(folderPath) || isFolderAutoExpandedBySelection(folderPath, selectedPath)
+}
+
 function flattenFiles(folder: FolderNode): MarkdownFile[] {
   return [...folder.files, ...folder.folders.flatMap(flattenFiles)]
 }
@@ -2428,14 +2481,6 @@ function normalizeBodyForCompare(value: string): string {
   return value.replace(/\r\n/g, '\n').trimEnd()
 }
 
-function encodePathForUrl(path: string): string {
-  return path
-    .split('/')
-    .filter(Boolean)
-    .map((segment) => encodeURIComponent(segment))
-    .join('/')
-}
-
 function decodePathFromUrl(path: string): string {
   return path
     .split('/')
@@ -2448,19 +2493,6 @@ function decodePathFromUrl(path: string): string {
       }
     })
     .join('/')
-}
-
-function buildEditorUrl(input: {
-  owner: string
-  repo: string
-  branch: string
-  rootPath: string
-  filePath: string | null
-}): string {
-  const base = `/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/${encodeURIComponent(input.branch)}`
-  const filePart = input.filePath ? `/${encodePathForUrl(input.filePath)}` : ''
-  const rootQuery = input.rootPath ? `?root=${encodeURIComponent(input.rootPath)}` : ''
-  return `${base}${filePart}${rootQuery}`
 }
 
 function errorToMessage(error: unknown): string {
