@@ -4,7 +4,7 @@ import { ArrowDown, Check, ChevronsUpDown, Loader2, Lock, Search } from 'lucide-
 import { useEffect, useMemo, useState } from 'react'
 import { Avatar, AvatarFallback, AvatarImage } from '#/components/ui/avatar'
 import { Button } from '#/components/ui/button'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '#/components/ui/card'
+import { Card, CardContent, CardHeader, CardTitle } from '#/components/ui/card'
 import {
   DropdownMenuGroup,
   DropdownMenuLabel,
@@ -42,6 +42,13 @@ type RepoItem = {
   updatedAt: string
 }
 
+type RecentRepoItem = {
+  owner: string
+  repo: string
+  branch: string
+  visitedAt: string
+}
+
 type RouteSearch = {
   owner?: string
   repo?: string
@@ -59,6 +66,8 @@ type OwnersCache = {
 
 let ownersCache: OwnersCache | null = null
 let hasResolvedHomeSessionOnce = false
+const RECENT_REPOS_STORAGE_KEY = 'pullnotes.recent-repos'
+const MAX_RECENT_REPOS = 8
 
 const onboardingOwnersServerFn = createServerFn({ method: 'GET' }).handler(async () => {
   const accessToken = await requireGitHubAccessToken()
@@ -197,6 +206,8 @@ function SelectorPage() {
   const [repos, setRepos] = useState<RepoItem[]>([])
   const [isLoadingOwners, setIsLoadingOwners] = useState(false)
   const [isLoadingRepos, setIsLoadingRepos] = useState(false)
+  const [hasLoadedReposOnce, setHasLoadedReposOnce] = useState(false)
+  const [recentRepos, setRecentRepos] = useState<RecentRepoItem[]>([])
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [themeMode, setThemeMode] = useState<ThemeMode>('system')
   const isAuthenticated = Boolean(authSession?.user)
@@ -294,6 +305,11 @@ function SelectorPage() {
 
   useEffect(() => {
     if (typeof window === 'undefined') return
+    setRecentRepos(readRecentReposFromStorage())
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
     const nextTheme = window.localStorage.getItem('theme')
     if (nextTheme === 'dark' || nextTheme === 'light' || nextTheme === 'system') {
       setThemeMode(nextTheme)
@@ -318,12 +334,14 @@ function SelectorPage() {
   useEffect(() => {
     if (!isAuthenticated || !selectedOwnerItem || !selectedOwnerItem.installationId) {
       setRepos([])
+      setHasLoadedReposOnce(false)
+      setIsLoadingRepos(false)
       return
     }
 
+    setIsLoadingRepos(true)
     const timeout = setTimeout(() => {
       void (async () => {
-        setIsLoadingRepos(true)
         setErrorMessage(null)
 
         try {
@@ -335,6 +353,7 @@ function SelectorPage() {
             },
           })
           setRepos(data.repos)
+          setHasLoadedReposOnce(true)
         } catch (error) {
           setErrorMessage(errorToMessage(error))
         } finally {
@@ -358,14 +377,44 @@ function SelectorPage() {
     await navigate({ to: '/' })
   }
 
-  const openRepo = async (repo: RepoItem) => {
+  const rememberRecentRepo = (item: Omit<RecentRepoItem, 'visitedAt'>) => {
+    const nextEntry: RecentRepoItem = {
+      ...item,
+      visitedAt: new Date().toISOString(),
+    }
+
+    setRecentRepos((prev) => {
+      const deduped = prev.filter(
+        (entry) =>
+          !(
+            entry.owner.toLowerCase() === nextEntry.owner.toLowerCase() &&
+            entry.repo.toLowerCase() === nextEntry.repo.toLowerCase() &&
+            entry.branch.toLowerCase() === nextEntry.branch.toLowerCase()
+          ),
+      )
+      const next = [nextEntry, ...deduped].slice(0, MAX_RECENT_REPOS)
+      writeRecentReposToStorage(next)
+      return next
+    })
+  }
+
+  const openRepoTarget = async (target: { owner: string; repo: string; branch: string }) => {
+    rememberRecentRepo(target)
     await navigate({
       to: '/$owner/$repo/$branch',
       params: {
-        owner: selectedOwner,
-        repo: repo.name,
-        branch: repo.defaultBranch || 'main',
+        owner: target.owner,
+        repo: target.repo,
+        branch: target.branch,
       },
+    })
+  }
+
+  const openRepo = async (repo: RepoItem) => {
+    await openRepoTarget({
+      owner: selectedOwner,
+      repo: repo.name,
+      branch: repo.defaultBranch || 'main',
     })
   }
 
@@ -419,13 +468,47 @@ function SelectorPage() {
 
   return (
     <main className="relative grid min-h-screen place-items-center px-6 py-16">
+      <div className="w-full max-w-xl space-y-4">
+      {recentRepos.length > 0 ? (
+        <Card className="gap-4 py-4">
+          <CardHeader>
+            <div className="space-y-1">
+              <CardTitle>Recently visited</CardTitle>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            <ul className="space-y-2">
+              {recentRepos.slice(0, 5).map((item) => (
+                <li
+                  key={`${item.owner}/${item.repo}/${item.branch}`}
+                  className="flex h-10 items-center justify-between gap-2 rounded-md border px-3"
+                >
+                  <button
+                    type="button"
+                    className="min-w-0 flex items-center gap-2 text-left text-sm"
+                    onClick={() => void openRepoTarget(item)}
+                  >
+                    <img
+                      src={`https://github.com/${item.owner}.png`}
+                      alt={item.owner}
+                      className="size-5 rounded-sm"
+                    />
+                    <span className="truncate font-medium">{item.repo}</span>
+                    <span className="text-xs text-muted-foreground">{formatTimeAgo(item.visitedAt)}</span>
+                  </button>
+                  <Button type="button" size="xs" variant="outline" onClick={() => void openRepoTarget(item)}>
+                    Open
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
+      ) : null}
       <Card className="w-full max-w-xl gap-4 py-4">
         <CardHeader>
           <div className="space-y-1">
             <CardTitle>Choose a repository</CardTitle>
-            <CardDescription>
-              Select an account, search installed repositories, and open one to edit Markdown.
-            </CardDescription>
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -558,7 +641,7 @@ function SelectorPage() {
                         <Skeleton className="h-6 w-14" />
                       </li>
                     ))
-                  ) : repos.length === 0 ? (
+                  ) : hasLoadedReposOnce && repos.length === 0 ? (
                     <li className="flex h-10 items-center rounded-md border px-3 text-sm text-muted-foreground">
                       No repositories found.
                     </li>
@@ -597,6 +680,7 @@ function SelectorPage() {
         )}
         </CardContent>
       </Card>
+      </div>
 
       <div className="absolute bottom-6 left-6 size-8">
         <DropdownMenu>
@@ -642,6 +726,38 @@ function SelectorPage() {
       </div>
     </main>
   )
+}
+
+function readRecentReposFromStorage(): RecentRepoItem[] {
+  try {
+    const raw = window.localStorage.getItem(RECENT_REPOS_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) return []
+
+    return parsed
+      .filter((item): item is RecentRepoItem => {
+        return Boolean(
+          item &&
+            typeof item === 'object' &&
+            typeof (item as RecentRepoItem).owner === 'string' &&
+            typeof (item as RecentRepoItem).repo === 'string' &&
+            typeof (item as RecentRepoItem).branch === 'string' &&
+            typeof (item as RecentRepoItem).visitedAt === 'string',
+        )
+      })
+      .slice(0, MAX_RECENT_REPOS)
+  } catch {
+    return []
+  }
+}
+
+function writeRecentReposToStorage(value: RecentRepoItem[]) {
+  try {
+    window.localStorage.setItem(RECENT_REPOS_STORAGE_KEY, JSON.stringify(value))
+  } catch {
+    // ignore storage write failures
+  }
 }
 
 function formatTimeAgo(isoDate: string): string {

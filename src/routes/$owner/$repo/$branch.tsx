@@ -1,7 +1,6 @@
 import { createFileRoute, useBlocker, useNavigate, useParams, useSearch } from '@tanstack/react-router'
 import { createServerFn, useServerFn } from '@tanstack/react-start'
 import {
-  Check,
   ChevronDown,
   ChevronRight,
   ChevronsUpDown,
@@ -12,9 +11,9 @@ import {
   Loader2,
   LogIn,
   Plus,
-  Save,
   Search,
   SmilePlus,
+  Undo2,
 } from 'lucide-react'
 import { useTheme } from 'next-themes'
 import { toast } from 'sonner'
@@ -326,6 +325,7 @@ export function App() {
   const { data: authSession, isPending: authPending } = authClient.useSession()
   const titleInputRef = useRef<HTMLInputElement>(null)
   const editorRegionRef = useRef<HTMLDivElement>(null)
+  const isResolvingLeaveRef = useRef(false)
 
   const [files, setFiles] = useState<MarkdownFile[]>([])
   const [filterQuery, setFilterQuery] = useState('')
@@ -501,13 +501,10 @@ export function App() {
     expandParents(selectedPath, setExpandedFolders)
   }, [selectedPath])
 
-  useBlocker({
-    shouldBlockFn: () => {
-      if (!isDirty || isSaving) return false
-      if (typeof window === 'undefined') return true
-      return !window.confirm('You have unsaved changes. Leave this page without saving?')
-    },
+  const leaveBlocker = useBlocker({
+    shouldBlockFn: () => isDirty && !isSaving,
     enableBeforeUnload: isDirty,
+    withResolver: true,
   })
 
   const repoUrl = `https://github.com/${owner}/${repo}/tree/${branch}${rootPath ? `/${rootPath}` : ''}`
@@ -760,12 +757,12 @@ export function App() {
     })
   }
 
-  const handleSave = async () => {
-    if (!selectedPath) return
+  const handleSave = async (): Promise<boolean> => {
+    if (!selectedPath) return false
     const cleanTitle = title.trim()
     if (!cleanTitle) {
       setErrorMessage('Title is required.')
-      return
+      return false
     }
 
     setIsSaving(true)
@@ -801,13 +798,26 @@ export function App() {
       await refreshFiles()
       await loadRecentCommits()
       toast.success('Saved', { id: toastId })
+      return true
     } catch (error) {
       const message = errorToMessage(error)
       setErrorMessage(message)
       showErrorToast(toastId, message)
+      return false
     } finally {
       setIsSaving(false)
     }
+  }
+
+  const handleResetChanges = () => {
+    if (!isDirty || !isSelectedFileLoaded || isSaving) return
+    if (!window.confirm('Discard all unsaved changes?')) return
+
+    setTitle(savedTitle)
+    setIcon(savedIcon)
+    setCover(savedCover)
+    setBody(savedBody)
+    setErrorMessage(null)
   }
 
   useEffect(() => {
@@ -827,6 +837,34 @@ export function App() {
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [isAuthenticated, selectedPath, isSaving, isLoadingFile, isDirty, titleMissing, handleSave])
+
+  useEffect(() => {
+    if (leaveBlocker.status !== 'blocked' || isResolvingLeaveRef.current) return
+    isResolvingLeaveRef.current = true
+
+    void (async () => {
+      if (typeof window === 'undefined') {
+        leaveBlocker.proceed?.()
+        isResolvingLeaveRef.current = false
+        return
+      }
+
+      const shouldSave = window.confirm(
+        'You have unsaved changes. Press OK to save before leaving, or Cancel to leave without saving.',
+      )
+
+      if (!shouldSave) {
+        leaveBlocker.proceed?.()
+        isResolvingLeaveRef.current = false
+        return
+      }
+
+      const didSave = await handleSave()
+      if (didSave) leaveBlocker.proceed?.()
+      else leaveBlocker.reset?.()
+      isResolvingLeaveRef.current = false
+    })()
+  }, [leaveBlocker, handleSave])
 
   const handleCreate = async () => {
     const nextTitle = window.prompt('Title')
@@ -1595,19 +1633,31 @@ export function App() {
                     </DropdownMenuContent>
                   </DropdownMenu>
                 ) : null}
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  className="h-7 px-2 text-xs"
-                  onClick={() => void handleSave()}
-                  disabled={!canSave}
-                >
-                  Save
-                  {isSaving ? <Loader2 className="ml-2 size-3.5 animate-spin" /> : null}
-                  {!isSaving && canSave ? <Save className="ml-2 size-3.5" /> : null}
-                  {!isSaving && !canSave ? <Check className="ml-2 size-3.5" /> : null}
-                </Button>
+                <div className="inline-flex items-center">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 rounded-r-none px-2 text-xs"
+                    onClick={() => void handleSave()}
+                    disabled={!canSave}
+                  >
+                    Save
+                    {isSaving ? <Loader2 className="ml-2 size-3.5 animate-spin" /> : null}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 w-7 rounded-l-none border-l-0 p-0"
+                    onClick={handleResetChanges}
+                    disabled={!isDirty || !isSelectedFileLoaded || isSaving}
+                    title="Discard all unsaved changes"
+                    aria-label="Discard all unsaved changes"
+                  >
+                    <Undo2 className="size-3.5" />
+                  </Button>
+                </div>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
