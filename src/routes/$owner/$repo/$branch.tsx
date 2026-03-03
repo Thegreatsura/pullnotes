@@ -1,6 +1,7 @@
 import { createFileRoute, useBlocker, useNavigate, useParams, useSearch } from '@tanstack/react-router'
 import { createServerFn, useServerFn } from '@tanstack/react-start'
 import {
+  Command,
   ChevronDown,
   ChevronRight,
   ChevronsUpDown,
@@ -323,7 +324,7 @@ export function App() {
   const searchPexels = useServerFn(searchPexelsServerFn)
 
   const { data: authSession, isPending: authPending } = authClient.useSession()
-  const titleInputRef = useRef<HTMLInputElement>(null)
+  const titleInputRef = useRef<HTMLTextAreaElement>(null)
   const editorRegionRef = useRef<HTMLDivElement>(null)
   const isResolvingLeaveRef = useRef(false)
 
@@ -345,6 +346,7 @@ export function App() {
   const [savedIcon, setSavedIcon] = useState('')
   const [savedCover, setSavedCover] = useState('')
   const [savedBody, setSavedBody] = useState('')
+  const [hasUserEdits, setHasUserEdits] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [recentCommits, setRecentCommits] = useState<Array<{
     sha: string
@@ -479,6 +481,7 @@ export function App() {
   }, [isCoverPopoverOpen, coverQuery, searchPexels])
 
   const isDirty =
+    hasUserEdits &&
     hasLoadedFile &&
     !isLoadingFile &&
     loadedPath === selectedPath &&
@@ -602,6 +605,7 @@ export function App() {
     setSavedIcon('')
     setSavedCover('')
     setSavedBody('')
+    setHasUserEdits(false)
     setErrorMessage(null)
     setRecentCommits([])
     setIsLoadingRepo(true)
@@ -662,6 +666,7 @@ export function App() {
       setSavedIcon(cached.icon)
       setSavedCover(cached.cover)
       setSavedBody(cached.body)
+      setHasUserEdits(false)
       setHasLoadedFile(true)
     } else {
       setHasLoadedFile(false)
@@ -690,6 +695,7 @@ export function App() {
         setSavedIcon(file.icon)
         setSavedCover(file.cover)
         setSavedBody(file.body)
+        setHasUserEdits(false)
         setHasLoadedFile(true)
         writeCachedMarkdownFile(activeTarget, file.path, {
           sha: file.sha,
@@ -735,11 +741,17 @@ export function App() {
       return
     }
     setErrorMessage(null)
+    if (trimmed !== cover.trim()) {
+      setHasUserEdits(true)
+    }
     setCover(trimmed)
     setIsCoverPopoverOpen(false)
   }
 
   const handleSetIcon = (nextIcon: string) => {
+    if (nextIcon !== icon) {
+      setHasUserEdits(true)
+    }
     setIcon(nextIcon)
     setIsEmojiPopoverOpen(false)
     setEmojiQuery('')
@@ -757,7 +769,7 @@ export function App() {
     })
   }
 
-  const handleSave = async (): Promise<boolean> => {
+  const handleSave = async (options?: { silent?: boolean }): Promise<boolean> => {
     if (!selectedPath) return false
     const cleanTitle = title.trim()
     if (!cleanTitle) {
@@ -767,7 +779,7 @@ export function App() {
 
     setIsSaving(true)
     setErrorMessage(null)
-    const toastId = toast.loading('Saving changes...')
+    const toastId = options?.silent ? null : toast.loading('Saving changes...')
 
     try {
       const result = await saveFile({
@@ -788,6 +800,7 @@ export function App() {
       setSavedIcon(icon)
       setSavedCover(cover)
       setSavedBody(body)
+      setHasUserEdits(false)
       writeCachedMarkdownFile(activeTarget, selectedPath, {
         sha: result.sha,
         title: cleanTitle,
@@ -797,12 +810,18 @@ export function App() {
       })
       await refreshFiles()
       await loadRecentCommits()
-      toast.success('Saved', { id: toastId })
+      if (toastId !== null) {
+        toast.success('Saved', { id: toastId })
+      }
       return true
     } catch (error) {
       const message = errorToMessage(error)
       setErrorMessage(message)
-      showErrorToast(toastId, message)
+      if (toastId !== null) {
+        showErrorToast(toastId, message)
+      } else {
+        toast.error(message)
+      }
       return false
     } finally {
       setIsSaving(false)
@@ -817,12 +836,25 @@ export function App() {
     setIcon(savedIcon)
     setCover(savedCover)
     setBody(savedBody)
+    setHasUserEdits(false)
     setErrorMessage(null)
+  }
+
+  const handleBodyChange = (nextBody: string) => {
+    setBody(nextBody)
+    const isEditorFocused =
+      typeof document !== 'undefined' &&
+      Boolean(editorRegionRef.current?.contains(document.activeElement))
+    if (isEditorFocused && hasLoadedFile && loadedPath === selectedPath && !isLoadingFile) {
+      setHasUserEdits(true)
+    }
   }
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      const isSaveCombo = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's'
+      const hasPrimaryModifier = event.metaKey || event.ctrlKey
+      const hasOtherModifiers = event.altKey || event.shiftKey
+      const isSaveCombo = hasPrimaryModifier && !hasOtherModifiers && event.key.toLowerCase() === 's'
       if (!isSaveCombo) return
 
       event.preventDefault()
@@ -837,6 +869,16 @@ export function App() {
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [isAuthenticated, selectedPath, isSaving, isLoadingFile, isDirty, titleMissing, handleSave])
+
+  useEffect(() => {
+    if (!canSave || isSaving) return
+
+    const timeout = setTimeout(() => {
+      void handleSave({ silent: true })
+    }, 3000)
+
+    return () => clearTimeout(timeout)
+  }, [canSave, isSaving, handleSave])
 
   useEffect(() => {
     if (leaveBlocker.status !== 'blocked' || isResolvingLeaveRef.current) return
@@ -1072,6 +1114,7 @@ export function App() {
         setSavedIcon('')
         setSavedCover('')
         setSavedBody('')
+        setHasUserEdits(false)
         await refreshFiles()
       }
       await loadRecentCommits()
@@ -1180,6 +1223,7 @@ export function App() {
           setSavedIcon('')
           setSavedCover('')
           setSavedBody('')
+          setHasUserEdits(false)
           await refreshFiles()
         }
       } else {
@@ -1643,7 +1687,10 @@ export function App() {
                     disabled={!canSave}
                   >
                     Save
-                    {isSaving ? <Loader2 className="ml-2 size-3.5 animate-spin" /> : null}
+                    <span className="ml-2 inline-flex items-center gap-0.5 text-[10px] text-muted-foreground">
+                      <Command className="size-3" />
+                      <span>S</span>
+                    </span>
                   </Button>
                   <Button
                     type="button"
@@ -2015,19 +2062,28 @@ export function App() {
                     ) : null}
                   </div>
 
-                  <input
+                  <textarea
                     ref={titleInputRef}
-                    type="text"
                     value={title}
-                    onChange={(event) => setTitle(event.target.value)}
+                    onChange={(event) => {
+                      setTitle(event.target.value)
+                      if (hasLoadedFile && loadedPath === selectedPath && !isLoadingFile) {
+                        setHasUserEdits(true)
+                      }
+                    }}
                     onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        return
+                      }
                       if (event.key === 'ArrowDown') {
                         event.preventDefault()
                         focusEditor()
                       }
                     }}
                     placeholder="Title"
-                    className="w-full border-0 bg-transparent px-0 py-8 text-4xl font-extrabold tracking-tight text-balance leading-tight outline-none placeholder:text-muted-foreground focus:outline-none"
+                    rows={1}
+                    className="field-sizing-content w-full resize-none border-0 bg-transparent px-0 py-8 text-4xl font-extrabold tracking-tight text-balance leading-tight outline-none placeholder:text-muted-foreground focus:outline-none"
                   />
 
                     {titleMissing ? (
@@ -2043,7 +2099,7 @@ export function App() {
                       editorClassName="h-full min-h-full border-0 bg-transparent px-0 pt-2 pb-10 text-base leading-7 shadow-none focus-visible:ring-0 focus-visible:border-transparent"
                       format="markdown"
                       value={body}
-                      onChange={setBody}
+                      onChange={handleBodyChange}
                       onArrowUpAtStart={focusTitleInput}
                     />
                   </div>
