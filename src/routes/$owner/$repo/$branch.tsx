@@ -103,6 +103,13 @@ type CoverPhoto = {
   authorUrl: string
 }
 
+type RecentRepoItem = {
+  owner: string
+  repo: string
+  branch: string
+  visitedAt: string
+}
+
 type CachedMarkdownFile = {
   version: 1
   sha: string
@@ -146,6 +153,8 @@ const ICON_OPTIONS: EmojiOption[] = [
   { unicode: '🏁', label: 'flag' },
 ]
 const COVER_RESULT_SKELETON_IDS = ['a', 'b', 'c', 'd', 'e', 'f']
+const RECENT_REPOS_STORAGE_KEY = 'pullnotes.recent-repos'
+const MAX_RECENT_REPO_MENU_ITEMS = 5
 
 const listFilesServerFn = createServerFn({ method: 'GET' })
   .inputValidator((input: { target: RepoTargetInput }) => input)
@@ -365,6 +374,7 @@ export function App() {
   const [isCoverSearchLoading, setIsCoverSearchLoading] = useState(false)
   const [coverSearchError, setCoverSearchError] = useState<string | null>(null)
   const [highlightedPath, setHighlightedPath] = useState<string | null>(null)
+  const [recentRepos, setRecentRepos] = useState<RecentRepoItem[]>([])
 
   const owner = String(params.owner || '').trim()
   const repo = String(params.repo || '').trim()
@@ -498,6 +508,50 @@ export function App() {
     !isLoadingRepo &&
     !titleMissing &&
     isDirty
+  const recentRepoMenuItems = useMemo(
+    () =>
+      recentRepos
+        .filter(
+          (item) =>
+            !(
+              item.owner.toLowerCase() === owner.toLowerCase() &&
+              item.repo.toLowerCase() === repo.toLowerCase() &&
+              item.branch.toLowerCase() === branch.toLowerCase()
+            ),
+        )
+        .slice(0, MAX_RECENT_REPO_MENU_ITEMS),
+    [recentRepos, owner, repo, branch],
+  )
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    setRecentRepos(readRecentReposFromStorage())
+  }, [])
+
+  useEffect(() => {
+    if (!owner || !repo || !branch) return
+
+    const nextEntry: RecentRepoItem = {
+      owner,
+      repo,
+      branch,
+      visitedAt: new Date().toISOString(),
+    }
+
+    setRecentRepos((prev) => {
+      const deduped = prev.filter(
+        (item) =>
+          !(
+            item.owner.toLowerCase() === nextEntry.owner.toLowerCase() &&
+            item.repo.toLowerCase() === nextEntry.repo.toLowerCase() &&
+            item.branch.toLowerCase() === nextEntry.branch.toLowerCase()
+          ),
+      )
+      const next = [nextEntry, ...deduped]
+      writeRecentReposToStorage(next)
+      return next
+    })
+  }, [owner, repo, branch])
 
   useEffect(() => {
     if (!selectedPath) return
@@ -1041,6 +1095,17 @@ export function App() {
     await navigate({ to: '/', replace: true })
   }
 
+  const handleOpenRecentRepo = (item: RecentRepoItem) => {
+    void navigate({
+      to: '/$owner/$repo/$branch',
+      params: {
+        owner: item.owner,
+        repo: item.repo,
+        branch: item.branch,
+      },
+    })
+  }
+
   const handleRename = async () => {
     if (!selectedPath || !sha) return
     const current = fileLabel(selectedPath)
@@ -1446,9 +1511,30 @@ export function App() {
                           </DropdownMenuShortcut>
                         </a>
                       </DropdownMenuItem>
-                      <DropdownMenuSeparator />
+                      {recentRepoMenuItems.length > 0 ? (
+                        <>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuLabel className="text-xs text-muted-foreground">
+                            Recent repositories
+                          </DropdownMenuLabel>
+                          {recentRepoMenuItems.map((item) => (
+                            <DropdownMenuItem
+                              key={`${item.owner}/${item.repo}/${item.branch}`}
+                              onSelect={() => handleOpenRecentRepo(item)}
+                            >
+                              <img
+                                src={`https://github.com/${item.owner}.png`}
+                                alt={item.owner}
+                                className="size-4 rounded-sm"
+                              />
+                              <span className="truncate">{item.repo}</span>
+                            </DropdownMenuItem>
+                          ))}
+                          <DropdownMenuSeparator />
+                        </>
+                      ) : null}
                       <DropdownMenuItem onSelect={() => void navigate({ to: '/' })}>
-                        Change repository
+                        Choose another repository
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -2552,6 +2638,38 @@ function isFolderExpanded(
   expandedFolders: Set<string>,
 ): boolean {
   return expandedFolders.has(folderPath) || isFolderAutoExpandedBySelection(folderPath, selectedPath)
+}
+
+function readRecentReposFromStorage(): RecentRepoItem[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = window.localStorage.getItem(RECENT_REPOS_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) return []
+
+    return parsed.filter((item): item is RecentRepoItem => {
+      return Boolean(
+        item &&
+          typeof item === 'object' &&
+          typeof (item as RecentRepoItem).owner === 'string' &&
+          typeof (item as RecentRepoItem).repo === 'string' &&
+          typeof (item as RecentRepoItem).branch === 'string' &&
+          typeof (item as RecentRepoItem).visitedAt === 'string',
+      )
+    })
+  } catch {
+    return []
+  }
+}
+
+function writeRecentReposToStorage(value: RecentRepoItem[]) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(RECENT_REPOS_STORAGE_KEY, JSON.stringify(value))
+  } catch {
+    // ignore storage write errors
+  }
 }
 
 function flattenFiles(folder: FolderNode): MarkdownFile[] {

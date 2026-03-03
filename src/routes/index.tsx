@@ -483,19 +483,24 @@ function SelectorPage() {
                   key={`${item.owner}/${item.repo}/${item.branch}`}
                   className="flex h-10 items-center justify-between gap-2 rounded-md border px-3"
                 >
-                  <button
-                    type="button"
-                    className="min-w-0 flex items-center gap-2 text-left text-sm"
-                    onClick={() => void openRepoTarget(item)}
-                  >
+                  <div className="min-w-0 flex items-center gap-2 text-sm">
                     <img
                       src={`https://github.com/${item.owner}.png`}
                       alt={item.owner}
                       className="size-5 rounded-sm"
                     />
-                    <span className="truncate font-medium">{item.repo}</span>
+                    <a
+                      href={`/${encodeURIComponent(item.owner)}/${encodeURIComponent(item.repo)}/${encodeURIComponent(item.branch)}`}
+                      onClick={(event) => {
+                        event.preventDefault()
+                        void openRepoTarget(item)
+                      }}
+                      className="truncate font-medium hover:underline"
+                    >
+                      {item.repo}
+                    </a>
                     <span className="text-xs text-muted-foreground">{formatTimeAgo(item.visitedAt)}</span>
-                  </button>
+                  </div>
                   <Button type="button" size="xs" variant="outline" onClick={() => void openRepoTarget(item)}>
                     Open
                   </Button>
