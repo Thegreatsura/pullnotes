@@ -523,7 +523,6 @@ export function App() {
   const searchPexels = useServerFn(searchPexelsServerFn)
   const uploadImageAsset = useServerFn(uploadImageAssetServerFn)
   const getRepoVisibilityFn = useServerFn(repoVisibilityServerFn)
-  const listMediaDirectory = useServerFn(listMediaDirectoryServerFn)
   const moveSubtree = useServerFn(moveSubtreeServerFn)
 
   const { data: authSession, isPending: authPending } = authClient.useSession()
@@ -577,10 +576,6 @@ export function App() {
   const [isRepoPrivate, setIsRepoPrivate] = useState(false)
   const [bodyForEditor, setBodyForEditor] = useState('')
   const [coverLayoutTick, setCoverLayoutTick] = useState(0)
-  const mediaDirectoryCacheRef = useRef(
-    new Map<string, { expiresAt: number; files: Map<string, string> }>(),
-  )
-  const mediaDirectoryRequestRef = useRef(new Map<string, Promise<Map<string, string>>>())
   const latestDraftRef = useRef({
     title: '',
     icon: '',
@@ -722,68 +717,16 @@ export function App() {
   useEffect(() => {
     let cancelled = false
 
-    const resolveDirectoryFileMap = async (directoryPath: string) => {
-      const key = directoryPath
-      const cached = mediaDirectoryCacheRef.current.get(key)
-      if (cached && cached.expiresAt > Date.now()) {
-        return cached.files
-      }
-
-      const pending = mediaDirectoryRequestRef.current.get(key)
-      if (pending) return pending
-
-      const request = (async () => {
-        const result = await listMediaDirectory({
-          data: {
-            target: activeTarget,
-            directoryPath,
-          },
-        })
-        const files = new Map<string, string>()
-        for (const item of result) {
-          if (!item.name || !item.url) continue
-          files.set(item.name, item.url)
-        }
-        mediaDirectoryCacheRef.current.set(key, {
-          expiresAt: Date.now() + 30_000,
-          files,
-        })
-        return files
-      })().finally(() => {
-        mediaDirectoryRequestRef.current.delete(key)
-      })
-
-      mediaDirectoryRequestRef.current.set(key, request)
-      return request
-    }
-
     const resolveDisplayUrl = async (source: string): Promise<string> => {
       if (isNonRelativeUrl(source)) return source
-      if (!isRepoPrivate) {
-        return toGitHubImageUrl({
-          owner,
-          repo,
-          branch,
-          rootPath,
-          relativePath: source,
-        })
-      }
-
-      const relativePath = source.replace(/^\/+/, '')
-      const filename = getFileName(relativePath)
-      if (!filename) return source
-      const directoryPath = getParentPath(relativePath)
-      const files = await resolveDirectoryFileMap(directoryPath)
-      return (
-        files.get(filename) ||
-        toGitHubImageUrl({
-          owner,
-          repo,
-          branch,
-          rootPath,
-          relativePath: source,
-        })
-      )
+      return toGitHubImageUrl({
+        owner,
+        repo,
+        branch,
+        rootPath,
+        relativePath: source,
+        privateRepo: isRepoPrivate,
+      })
     }
 
     const build = async () => {
@@ -807,7 +750,7 @@ export function App() {
     return () => {
       cancelled = true
     }
-  }, [body, owner, repo, branch, rootPath, isRepoPrivate, activeTarget, listMediaDirectory])
+  }, [body, owner, repo, branch, rootPath, isRepoPrivate])
   const filteredEmojiOptions = useMemo(() => {
     const query = emojiQuery.trim().toLowerCase()
     if (!query) return ICON_OPTIONS
@@ -1396,48 +1339,12 @@ export function App() {
       branch,
       rootPath,
       relativePath,
+      privateRepo: isRepoPrivate,
     })
 
-    if (!isRepoPrivate) {
-      return {
-        relativePath,
-        editorPath: defaultEditorPath,
-      }
-    }
-
-    const directoryPath = getParentPath(relativePath)
-    mediaDirectoryCacheRef.current.delete(directoryPath)
-    mediaDirectoryRequestRef.current.delete(directoryPath)
-
-    try {
-      const list = await listMediaDirectory({
-        data: {
-          target: activeTarget,
-          directoryPath,
-        },
-      })
-      const byName = new Map<string, string>()
-      for (const item of list) {
-        if (!item.name || !item.url) continue
-        byName.set(item.name, item.url)
-      }
-
-      mediaDirectoryCacheRef.current.set(directoryPath, {
-        expiresAt: Date.now() + 30_000,
-        files: byName,
-      })
-
-      const filename = getFileName(relativePath)
-      const resolved = filename ? byName.get(filename) : null
-      return {
-        relativePath,
-        editorPath: resolved || defaultEditorPath,
-      }
-    } catch {
-      return {
-        relativePath,
-        editorPath: defaultEditorPath,
-      }
+    return {
+      relativePath,
+      editorPath: defaultEditorPath,
     }
   }
 
@@ -4515,6 +4422,7 @@ function toGitHubImageUrl(input: {
   branch: string
   rootPath: string
   relativePath: string
+  privateRepo?: boolean
 }): string {
   const src = input.relativePath.trim()
   if (!src) return src
@@ -4524,6 +4432,10 @@ function toGitHubImageUrl(input: {
   if (!relativePath) return src
   const rootPath = input.rootPath.replace(/^\/+|\/+$/g, '')
   const repoPath = rootPath ? `${rootPath}/${relativePath}` : relativePath
+
+  if (input.privateRepo) {
+    return `https://github.com/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/raw/${encodeURIComponent(input.branch)}/${encodeURI(repoPath)}`
+  }
 
   return `https://raw.githubusercontent.com/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/${encodeURIComponent(input.branch)}/${encodeURI(repoPath)}`
 }
@@ -4540,12 +4452,17 @@ function fromRenderedImageUrl(input: {
 
   const rawPrefix = `https://raw.githubusercontent.com/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/${encodeURIComponent(input.branch)}/`
   const mediaPrefix = `https://media.githubusercontent.com/media/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/${encodeURIComponent(input.branch)}/`
+  const githubRawPrefix = `https://github.com/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/raw/${encodeURIComponent(input.branch)}/`
   if (src.startsWith(rawPrefix)) {
     const [rawPath] = src.slice(rawPrefix.length).split('?')
     return normalizeStoredImagePath(trimImageRootPath(decodePathFromUrl(rawPath), input.rootPath))
   }
   if (src.startsWith(mediaPrefix)) {
     const [rawPath] = src.slice(mediaPrefix.length).split('?')
+    return normalizeStoredImagePath(trimImageRootPath(decodePathFromUrl(rawPath), input.rootPath))
+  }
+  if (src.startsWith(githubRawPrefix)) {
+    const [rawPath] = src.slice(githubRawPrefix.length).split('?')
     return normalizeStoredImagePath(trimImageRootPath(decodePathFromUrl(rawPath), input.rootPath))
   }
 
@@ -4563,6 +4480,10 @@ function fromRenderedImageUrl(input: {
     }
     if (parsed.href.startsWith(mediaPrefix)) {
       const [rawPath] = parsed.href.slice(mediaPrefix.length).split('?')
+      return normalizeStoredImagePath(trimImageRootPath(decodePathFromUrl(rawPath), input.rootPath))
+    }
+    if (parsed.href.startsWith(githubRawPrefix)) {
+      const [rawPath] = parsed.href.slice(githubRawPrefix.length).split('?')
       return normalizeStoredImagePath(trimImageRootPath(decodePathFromUrl(rawPath), input.rootPath))
     }
     if (parsed.pathname.startsWith(proxyPrefix)) {
