@@ -33,6 +33,14 @@ import {
 } from '#/components/ui/breadcrumb'
 import { Button } from '#/components/ui/button'
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '#/components/ui/dialog'
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuGroup,
@@ -127,6 +135,27 @@ type CachedMarkdownFile = {
   updatedAt: number
 }
 
+type MergeChoice = 'local' | 'remote' | 'both'
+type BodyConflict = {
+  id: string
+  local: string
+  remote: string
+}
+type BodyMergePart =
+  | {
+      kind: 'text'
+      lines: string[]
+    }
+  | {
+      kind: 'conflict'
+      conflict: BodyConflict
+    }
+type MergeReviewState = {
+  open: boolean
+  parts: BodyMergePart[]
+  choices: Record<string, MergeChoice>
+}
+
 const ICON_OPTIONS: EmojiOption[] = [
   { unicode: '😀', label: 'grinning face' },
   { unicode: '😁', label: 'beaming face' },
@@ -163,6 +192,7 @@ const COVER_RESULT_SKELETON_IDS = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
 const RECENT_REPOS_STORAGE_KEY = 'pullnotes.recent-repos'
 const MAX_RECENT_REPO_MENU_ITEMS = 5
 const IMAGE_ASSET_ROOT = '_files'
+const AUTOSAVE_ENABLED_STORAGE_KEY = 'pullnotes.autosave-enabled'
 
 const listFilesServerFn = createServerFn({ method: 'POST' })
   .inputValidator((input: { target: RepoTargetInput }) => input)
@@ -460,7 +490,11 @@ export function App() {
   const [pendingImageUploads, setPendingImageUploads] = useState(0)
   const [isSlashCommandOpen, setIsSlashCommandOpen] = useState(false)
   const [isAutosaveEnabled, setIsAutosaveEnabled] = useState(true)
-  const [isAutosavePausedForReview, setIsAutosavePausedForReview] = useState(false)
+  const [mergeReview, setMergeReview] = useState<MergeReviewState>({
+    open: false,
+    parts: [],
+    choices: {},
+  })
 
   useEffect(() => {
     return () => {
@@ -490,6 +524,11 @@ export function App() {
     setActiveTocId(null)
     setPendingImageUploads(0)
     setIsSlashCommandOpen(false)
+    setMergeReview({
+      open: false,
+      parts: [],
+      choices: {},
+    })
   }, [selectedPath])
 
   useEffect(() => {
@@ -758,6 +797,18 @@ export function App() {
     !isLoadingRepo &&
     !titleMissing &&
     isDirty
+  const mergeConflictParts = useMemo(
+    () =>
+      mergeReview.parts.filter(
+        (part): part is Extract<BodyMergePart, { kind: 'conflict' }> => part.kind === 'conflict',
+      ),
+    [mergeReview.parts],
+  )
+  const mergeConflictCount = mergeConflictParts.length
+  const mergePreviewBody = useMemo(
+    () => materializeMergeParts(mergeReview.parts, mergeReview.choices),
+    [mergeReview.parts, mergeReview.choices],
+  )
   const recentRepoMenuItems = useMemo(
     () =>
       recentRepos
@@ -776,7 +827,15 @@ export function App() {
   useEffect(() => {
     if (typeof window === 'undefined') return
     setRecentRepos(readRecentReposFromStorage())
+    const raw = window.localStorage.getItem(AUTOSAVE_ENABLED_STORAGE_KEY)
+    if (raw === 'true') setIsAutosaveEnabled(true)
+    if (raw === 'false') setIsAutosaveEnabled(false)
   }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(AUTOSAVE_ENABLED_STORAGE_KEY, isAutosaveEnabled ? 'true' : 'false')
+  }, [isAutosaveEnabled])
 
   useEffect(() => {
     if (!owner || !repo || !branch) return
@@ -1129,9 +1188,11 @@ export function App() {
           mergedTitle.conflict || mergedIcon.conflict || mergedCover.conflict || mergedBody.conflict
 
         if (hasConflict) {
-          setIsAutosavePausedForReview(true)
+          if (mergedBody.conflict) {
+            openMergeReview(mergedBody.parts)
+          }
           toast.warning(
-            'Remote and local changes overlapped. Kept your local content where needed and paused autosave until your next manual save.',
+            'Remote and local changes overlapped. Review merge choices before your next save.',
           )
         } else {
           toast('Remote changes were merged into your local draft.')
@@ -1324,6 +1385,28 @@ export function App() {
     setErrorMessage(null)
   }
 
+  const openMergeReview = (parts: BodyMergePart[]) => {
+    const choices: Record<string, MergeChoice> = {}
+    for (const part of parts) {
+      if (part.kind !== 'conflict') continue
+      choices[part.conflict.id] = 'local'
+    }
+    setMergeReview({
+      open: true,
+      parts,
+      choices,
+    })
+  }
+
+  const handleApplyMergeReview = () => {
+    setBody(mergePreviewBody)
+    setHasUserEdits(true)
+    setMergeReview((prev) => ({
+      ...prev,
+      open: false,
+    }))
+  }
+
   const showErrorToast = (toastId: string | number, message: string) => {
     toast.error(message, {
       id: toastId,
@@ -1444,6 +1527,10 @@ export function App() {
         hadConflictMerge =
           mergedTitle.conflict || mergedIcon.conflict || mergedCover.conflict || mergedBody.conflict
 
+        if (mergedBody.conflict) {
+          openMergeReview(mergedBody.parts)
+        }
+
         setTitle(effectiveDraft.title)
         setIcon(effectiveDraft.icon)
         setCover(effectiveDraft.cover)
@@ -1469,9 +1556,6 @@ export function App() {
       const latestDraft = latestDraftRef.current
       const unchangedSinceSave = didEqualDraft(latestDraft, effectiveDraft)
       setHasUserEdits(!unchangedSinceSave)
-      if (!options?.silent) {
-        setIsAutosavePausedForReview(false)
-      }
 
       setFiles((previous) =>
         previous.map((file) =>
@@ -1556,14 +1640,14 @@ export function App() {
   }, [isAuthenticated, selectedPath, isSaving, isLoadingFile, isDirty, titleMissing, handleSave])
 
   useEffect(() => {
-    if (!canSave || isSaving || isSlashCommandOpen || !isAutosaveEnabled || isAutosavePausedForReview) return
+    if (!canSave || isSaving || isSlashCommandOpen || !isAutosaveEnabled || mergeReview.open) return
 
     const timeout = setTimeout(() => {
       void handleSave({ silent: true })
     }, 3000)
 
     return () => clearTimeout(timeout)
-  }, [canSave, isSaving, isSlashCommandOpen, isAutosaveEnabled, isAutosavePausedForReview, handleSave])
+  }, [canSave, isSaving, isSlashCommandOpen, isAutosaveEnabled, mergeReview.open, handleSave])
 
   useEffect(() => {
     if (leaveBlocker.status !== 'blocked' || isResolvingLeaveRef.current) return
@@ -2561,9 +2645,6 @@ export function App() {
                     <Undo2 className="size-3.5" />
                   </Button>
                 </div>
-                {isAutosaveEnabled && isAutosavePausedForReview ? (
-                  <span className="text-xs text-amber-600">Autosave paused until next manual save</span>
-                ) : null}
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
@@ -3073,6 +3154,117 @@ export function App() {
           </div>
         </div>
       </SidebarInset>
+      <Dialog
+        open={mergeReview.open}
+        onOpenChange={(open) => {
+          setMergeReview((prev) => ({ ...prev, open }))
+        }}
+      >
+        <DialogContent className="max-h-[85vh] max-w-[95vw] sm:max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>Resolve conflicts</DialogTitle>
+            <DialogDescription>
+              Some of your local changes are conflicting with other changes. Pick what you want to
+              keep.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 overflow-y-auto">
+            <div className="space-y-4 pr-1">
+              {mergeConflictParts.map((part, index) => {
+                  const choice = mergeReview.choices[part.conflict.id] ?? 'local'
+                  const keepLocal = choice === 'local' || choice === 'both'
+                  const keepRemote = choice === 'remote' || choice === 'both'
+                  return (
+                    <Fragment key={part.conflict.id}>
+                      <div className="py-1">
+                        <div className="mb-3 inline-flex items-center rounded-md border p-0.5">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={choice === 'local' ? 'secondary' : 'ghost'}
+                            className="h-8 px-3"
+                            onClick={() =>
+                              setMergeReview((prev) => ({
+                                ...prev,
+                                choices: {
+                                  ...prev.choices,
+                                  [part.conflict.id]: 'local',
+                                },
+                              }))
+                            }
+                          >
+                            Local
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={choice === 'remote' ? 'secondary' : 'ghost'}
+                            className="h-8 px-3"
+                            onClick={() =>
+                              setMergeReview((prev) => ({
+                                ...prev,
+                                choices: {
+                                  ...prev.choices,
+                                  [part.conflict.id]: 'remote',
+                                },
+                              }))
+                            }
+                          >
+                            Remote
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={choice === 'both' ? 'secondary' : 'ghost'}
+                            className="h-8 px-3"
+                            onClick={() =>
+                              setMergeReview((prev) => ({
+                                ...prev,
+                                choices: {
+                                  ...prev.choices,
+                                  [part.conflict.id]: 'both',
+                                },
+                              }))
+                            }
+                          >
+                            Both
+                          </Button>
+                        </div>
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <div className={`min-h-0 rounded-md border p-2 ${keepLocal ? 'border-primary' : ''}`}>
+                            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                              Local changes
+                            </p>
+                            <pre className="max-h-40 overflow-auto rounded bg-muted/30 p-2 text-xs whitespace-pre-wrap">
+                              {part.conflict.local || '(empty)'}
+                            </pre>
+                          </div>
+                          <div className={`min-h-0 rounded-md border p-2 ${keepRemote ? 'border-primary' : ''}`}>
+                            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                              Remote changes
+                            </p>
+                            <pre className="max-h-40 overflow-auto rounded bg-muted/30 p-2 text-xs whitespace-pre-wrap">
+                              {part.conflict.remote || '(empty)'}
+                            </pre>
+                          </div>
+                        </div>
+                      </div>
+                      {index < mergeConflictParts.length - 1 ? <Separator className="my-4" /> : null}
+                    </Fragment>
+                  )
+                })}
+            </div>
+          </div>
+          <DialogFooter className="pt-4">
+            <Button type="button" variant="outline" onClick={() => setMergeReview((prev) => ({ ...prev, open: false }))}>
+              Close
+            </Button>
+            <Button type="button" onClick={handleApplyMergeReview}>
+              Apply choices
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <AboutPullNotesDialog open={isAboutOpen} onOpenChange={setIsAboutOpen} />
     </SidebarProvider>
   )
@@ -3605,15 +3797,31 @@ function mergeScalarField(input: { base: string; local: string; remote: string }
 function mergeBodyField(input: { base: string; local: string; remote: string }): {
   value: string
   conflict: boolean
+  parts: BodyMergePart[]
 } {
   if (input.local === input.remote) {
-    return { value: input.local, conflict: false }
+    const lines = splitLines(input.local)
+    return {
+      value: input.local,
+      conflict: false,
+      parts: lines.length ? [{ kind: 'text', lines }] : [],
+    }
   }
   if (input.local === input.base) {
-    return { value: input.remote, conflict: false }
+    const lines = splitLines(input.remote)
+    return {
+      value: input.remote,
+      conflict: false,
+      parts: lines.length ? [{ kind: 'text', lines }] : [],
+    }
   }
   if (input.remote === input.base) {
-    return { value: input.local, conflict: false }
+    const lines = splitLines(input.local)
+    return {
+      value: input.local,
+      conflict: false,
+      parts: lines.length ? [{ kind: 'text', lines }] : [],
+    }
   }
 
   const baseLines = splitLines(input.base)
@@ -3621,16 +3829,10 @@ function mergeBodyField(input: { base: string; local: string; remote: string }):
   const remoteChunks = diffLinesToChunks(baseLines, splitLines(input.remote))
 
   const merged = mergeLineChunks(baseLines, localChunks, remoteChunks)
-  if (!merged.conflict) {
-    return {
-      value: merged.lines.join('\n'),
-      conflict: false,
-    }
-  }
-
   return {
-    value: input.local,
-    conflict: true,
+    value: materializeMergeParts(merged.parts, {}),
+    conflict: merged.conflict,
+    parts: merged.parts,
   }
 }
 
@@ -3740,21 +3942,28 @@ function mergeLineChunks(
   base: string[],
   localChunks: LineChunk[],
   remoteChunks: LineChunk[],
-): { lines: string[]; conflict: boolean } {
-  const output: string[] = []
+): { parts: BodyMergePart[]; conflict: boolean } {
+  const parts: BodyMergePart[] = []
   let baseCursor = 0
   let localIndex = 0
   let remoteIndex = 0
   let hasConflict = false
+  let conflictCounter = 0
 
   const appendBase = (start: number, end: number) => {
     if (end <= start) return
-    output.push(...base.slice(start, end))
+    parts.push({
+      kind: 'text',
+      lines: base.slice(start, end),
+    })
   }
 
   const appendChunk = (chunk: LineChunk) => {
     appendBase(baseCursor, chunk.baseStart)
-    output.push(...chunk.replacement)
+    parts.push({
+      kind: 'text',
+      lines: chunk.replacement,
+    })
     baseCursor = chunk.baseEnd
   }
 
@@ -3827,21 +4036,61 @@ function mergeLineChunks(
     const remoteSlice = applyChunksToBaseSlice(base, clusterStart, clusterEnd, remoteCluster)
 
     if (stringArraysEqual(localSlice, remoteSlice)) {
-      output.push(...localSlice)
+      parts.push({
+        kind: 'text',
+        lines: localSlice,
+      })
     } else if (stringArraysEqual(localSlice, baseSlice)) {
-      output.push(...remoteSlice)
+      parts.push({
+        kind: 'text',
+        lines: remoteSlice,
+      })
     } else if (stringArraysEqual(remoteSlice, baseSlice)) {
-      output.push(...localSlice)
+      parts.push({
+        kind: 'text',
+        lines: localSlice,
+      })
     } else {
       hasConflict = true
-      output.push(...localSlice)
+      parts.push({
+        kind: 'conflict',
+        conflict: {
+          id: `conflict-${conflictCounter}`,
+          local: localSlice.join('\n'),
+          remote: remoteSlice.join('\n'),
+        },
+      })
+      conflictCounter += 1
     }
 
     baseCursor = clusterEnd
   }
 
   appendBase(baseCursor, base.length)
-  return { lines: output, conflict: hasConflict }
+  return { parts, conflict: hasConflict }
+}
+
+function materializeMergeParts(parts: BodyMergePart[], choices: Record<string, MergeChoice>): string {
+  const lines: string[] = []
+  for (const part of parts) {
+    if (part.kind === 'text') {
+      lines.push(...part.lines)
+      continue
+    }
+
+    const choice = choices[part.conflict.id] ?? 'local'
+    if (choice === 'local') {
+      if (part.conflict.local) lines.push(...splitLines(part.conflict.local))
+      continue
+    }
+    if (choice === 'remote') {
+      if (part.conflict.remote) lines.push(...splitLines(part.conflict.remote))
+      continue
+    }
+    if (part.conflict.local) lines.push(...splitLines(part.conflict.local))
+    if (part.conflict.remote) lines.push(...splitLines(part.conflict.remote))
+  }
+  return lines.join('\n')
 }
 
 function applyChunksToBaseSlice(
