@@ -273,6 +273,106 @@ const deleteFileServerFn = createServerFn({ method: 'POST' })
     return { ok: true as const }
   })
 
+const moveSubtreeServerFn = createServerFn({ method: 'POST' })
+  .inputValidator(
+    (input: {
+      target: RepoTargetInput
+      oldPath: string
+      newPath: string
+    }) => input,
+  )
+  .handler(async ({ data }) => {
+    await requireSession()
+    const userToken = await requireGitHubAccessToken()
+
+    const oldPath = data.oldPath.replace(/^\/+|\/+$/g, '')
+    const newPath = data.newPath.replace(/^\/+|\/+$/g, '')
+    if (!oldPath || !newPath || oldPath === newPath) {
+      return { moved: [] as Array<{ from: string; to: string }>, newRootPath: newPath || oldPath }
+    }
+
+    const allFiles = await listMarkdownEntriesViaGraphql(data.target)
+    const allPaths = allFiles.map((file) => file.path)
+    const oldDir = childDirectoryForPath(oldPath)
+    const newDir = childDirectoryForPath(newPath)
+
+    const subtreePaths = allPaths.filter((path) => path === oldPath || path.startsWith(`${oldDir}/`))
+    if (!subtreePaths.includes(oldPath)) {
+      throw new Error('Could not find source page to move.')
+    }
+
+    const movedSet = new Set(subtreePaths)
+    const moved: Array<{ from: string; to: string }> = subtreePaths.map((from) => {
+      if (from === oldPath) return { from, to: newPath }
+      const suffix = from.slice(`${oldDir}/`.length)
+      return { from, to: `${newDir}/${suffix}` }
+    })
+
+    const existingSet = new Set(allPaths)
+    for (const item of moved) {
+      if (item.from === item.to) continue
+      if (existingSet.has(item.to) && !movedSet.has(item.to)) {
+        throw new Error(`Cannot move page because "${item.to}" already exists.`)
+      }
+    }
+
+    const sourceByPath = new Map(
+      await Promise.all(
+        subtreePaths.map(async (path) => {
+          const source = await getMarkdownFile(data.target, path)
+          return [path, source] as const
+        }),
+      ),
+    )
+
+    const creates = [...moved].sort((a, b) => a.to.length - b.to.length)
+    for (const item of creates) {
+      const source = sourceByPath.get(item.from)
+      if (!source) continue
+      await upsertMarkdownFile(
+        data.target,
+        {
+          path: item.to,
+          content: source.content,
+          message: `chore(pullnotes): move ${item.from} -> ${item.to}`,
+        },
+        {
+          userToken,
+        },
+      )
+    }
+
+    const deletes = [...moved]
+      .map((item) => {
+        const source = sourceByPath.get(item.from)
+        return {
+          from: item.from,
+          sha: source?.sha || '',
+        }
+      })
+      .filter((item) => Boolean(item.sha))
+      .sort((a, b) => b.from.length - a.from.length)
+
+    for (const item of deletes) {
+      await deleteMarkdownFile(
+        data.target,
+        {
+          path: item.from,
+          sha: item.sha,
+          message: `chore(pullnotes): delete moved source ${item.from}`,
+        },
+        {
+          userToken,
+        },
+      )
+    }
+
+    return {
+      moved,
+      newRootPath: newPath,
+    }
+  })
+
 const recentCommitsServerFn = createServerFn({ method: 'GET' })
   .inputValidator((input: { target: RepoTargetInput }) => input)
   .handler(async ({ data }) => {
@@ -424,6 +524,7 @@ export function App() {
   const uploadImageAsset = useServerFn(uploadImageAssetServerFn)
   const getRepoVisibilityFn = useServerFn(repoVisibilityServerFn)
   const listMediaDirectory = useServerFn(listMediaDirectoryServerFn)
+  const moveSubtree = useServerFn(moveSubtreeServerFn)
 
   const { data: authSession, isPending: authPending } = authClient.useSession()
   const titleInputRef = useRef<HTMLTextAreaElement>(null)
@@ -1375,6 +1476,27 @@ export function App() {
     setIsCoverPopoverOpen(false)
   }
 
+  const handleUploadCover = async () => {
+    const file = await chooseImageFile()
+    if (!file) return
+
+    const toastId = toast.loading('Uploading cover...')
+    try {
+      const uploaded = await uploadImageToRepo(file)
+      if (uploaded.editorPath !== cover) {
+        setHasUserEdits(true)
+      }
+      setCover(uploaded.editorPath)
+      setErrorMessage(null)
+      setIsCoverPopoverOpen(false)
+      toast.success('Cover uploaded', { id: toastId })
+    } catch (error) {
+      const message = errorToMessage(error)
+      setErrorMessage(message)
+      showErrorToast(toastId, message)
+    }
+  }
+
   const handleSetIcon = (nextIcon: string) => {
     if (nextIcon !== icon) {
       setHasUserEdits(true)
@@ -2032,6 +2154,65 @@ export function App() {
     }
   }
 
+  const handleMovePageUnderPage = async (sourcePath: string, targetPath: string) => {
+    if (isSaving) return
+    if (sourcePath === targetPath) return
+    if (isDirty) {
+      toast.error('Save or discard your current changes before moving pages.')
+      return
+    }
+
+    if (isPathInsideMovedSubtree(targetPath, sourcePath)) {
+      toast.error('Cannot move a page into itself or one of its descendants.')
+      return
+    }
+
+    const nextPath = `${childDirectoryForPath(targetPath)}/${fileLabel(sourcePath)}.md`
+    if (nextPath === sourcePath) return
+
+    const confirmMove = window.confirm(
+      `Move "${entryTitle(fileMap.get(sourcePath) || { path: sourcePath, sha: '', title: '', icon: '', cover: '' })}" under "${entryTitle(fileMap.get(targetPath) || { path: targetPath, sha: '', title: '', icon: '', cover: '' })}"?`,
+    )
+    if (!confirmMove) return
+
+    setIsSaving(true)
+    setErrorMessage(null)
+    const toastId = toast.loading('Moving page...')
+    try {
+      const result = await moveSubtree({
+        data: {
+          target: activeTarget,
+          oldPath: sourcePath,
+          newPath: nextPath,
+        },
+      })
+
+      for (const movedItem of result.moved) {
+        deleteCachedMarkdownFile(activeTarget, movedItem.from)
+      }
+
+      const mappedSelectedPath = selectedPath
+        ? remapPathWithinMovedSubtree(selectedPath, sourcePath, nextPath)
+        : null
+
+      if (mappedSelectedPath && mappedSelectedPath !== selectedPath) {
+        setSelectedPathAndUrl(mappedSelectedPath, true)
+      }
+
+      await refreshFiles({ preferredPath: mappedSelectedPath || result.newRootPath })
+      expandParents(result.newRootPath, setExpandedFolders)
+      setHighlightedPath(result.newRootPath)
+      await loadRecentCommits()
+      toast.success('Page moved', { id: toastId })
+    } catch (error) {
+      const message = errorToMessage(error)
+      setErrorMessage(message)
+      showErrorToast(toastId, message)
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
   const childDirFor = (path: string) =>
     `${dirname(path) ? `${dirname(path)}/` : ''}${fileLabel(path)}`
 
@@ -2323,6 +2504,8 @@ export function App() {
                   onCreateChild={(path) => void handleCreateChild(path)}
                   onRename={(path) => void handleRenamePath(path)}
                   onDelete={(path) => void handleDeletePath(path)}
+                  onMoveUnder={(sourcePath, targetPath) => void handleMovePageUnderPage(sourcePath, targetPath)}
+                  canDrag={!isSaving}
                   toFileUrl={toFileUrl}
                 />
             )}
@@ -2766,15 +2949,28 @@ export function App() {
                         <PopoverContent className="w-[30rem] p-2" align="end" sideOffset={8}>
                           <div className="space-y-2">
                             <div className="relative">
-                              <Input
-                                value={coverQuery}
-                                onChange={(event) => setCoverQuery(event.target.value)}
-                                placeholder="Search Pexels"
-                                className="h-7 pr-8"
-                              />
-                              {isCoverSearchLoading ? (
-                                <Loader2 className="pointer-events-none absolute top-1/2 right-2 size-3.5 -translate-y-1/2 animate-spin text-muted-foreground" />
-                              ) : null}
+                              <div className="flex items-center gap-2">
+                                <div className="relative flex-1">
+                                  <Input
+                                    value={coverQuery}
+                                    onChange={(event) => setCoverQuery(event.target.value)}
+                                    placeholder="Search Pexels"
+                                    className="h-7 pr-8"
+                                  />
+                                  {isCoverSearchLoading ? (
+                                    <Loader2 className="pointer-events-none absolute top-1/2 right-2 size-3.5 -translate-y-1/2 animate-spin text-muted-foreground" />
+                                  ) : null}
+                                </div>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-7 px-2 text-xs"
+                                  onClick={() => void handleUploadCover()}
+                                >
+                                  Upload
+                                </Button>
+                              </div>
                             </div>
                             <div className="grid grid-cols-2 gap-2">
                               {isCoverSearchLoading
@@ -2851,7 +3047,7 @@ export function App() {
                             />
                             <Button
                               type="button"
-                              variant="ghost"
+                              variant="outline"
                               size="sm"
                               className="h-7 px-2 text-xs text-muted-foreground"
                               onClick={() => handleSetIcon('')}
@@ -2961,15 +3157,28 @@ export function App() {
                         <PopoverContent className="w-[30rem] p-2" align="start" sideOffset={8}>
                           <div className="space-y-2">
                             <div className="relative">
-                              <Input
-                                value={coverQuery}
-                                onChange={(event) => setCoverQuery(event.target.value)}
-                                placeholder="Search Pexels"
-                                className="h-7 pr-8"
-                              />
-                              {isCoverSearchLoading ? (
-                                <Loader2 className="pointer-events-none absolute top-1/2 right-2 size-3.5 -translate-y-1/2 animate-spin text-muted-foreground" />
-                              ) : null}
+                              <div className="flex items-center gap-2">
+                                <div className="relative flex-1">
+                                  <Input
+                                    value={coverQuery}
+                                    onChange={(event) => setCoverQuery(event.target.value)}
+                                    placeholder="Search Pexels"
+                                    className="h-7 pr-8"
+                                  />
+                                  {isCoverSearchLoading ? (
+                                    <Loader2 className="pointer-events-none absolute top-1/2 right-2 size-3.5 -translate-y-1/2 animate-spin text-muted-foreground" />
+                                  ) : null}
+                                </div>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-7 px-2 text-xs"
+                                  onClick={() => void handleUploadCover()}
+                                >
+                                  Upload
+                                </Button>
+                              </div>
                             </div>
                             <div className="grid grid-cols-2 gap-2">
                               {isCoverSearchLoading
@@ -3281,8 +3490,13 @@ function TreeView(props: {
   onCreateChild: (path: string) => void
   onRename: (path: string) => void
   onDelete: (path: string) => void
+  onMoveUnder: (sourcePath: string, targetPath: string) => void
+  canDrag: boolean
   toFileUrl: (path: string) => string
 }) {
+  const [dragSourcePath, setDragSourcePath] = useState<string | null>(null)
+  const [dropTargetPath, setDropTargetPath] = useState<string | null>(null)
+
   const fileMap = useMemo(() => {
     const files = flattenFiles(props.root)
     return new Map(files.map((file) => [file.path, file]))
@@ -3310,6 +3524,12 @@ function TreeView(props: {
         onCreateChild: props.onCreateChild,
         onRename: props.onRename,
         onDelete: props.onDelete,
+        onMoveUnder: props.onMoveUnder,
+        canDrag: props.canDrag,
+        dragSourcePath,
+        dropTargetPath,
+        setDragSourcePath,
+        setDropTargetPath,
         toFileUrl: props.toFileUrl,
       })}
     </SidebarMenu>
@@ -3329,6 +3549,12 @@ function renderFolderNode(args: {
   onCreateChild: (path: string) => void
   onRename: (path: string) => void
   onDelete: (path: string) => void
+  onMoveUnder: (sourcePath: string, targetPath: string) => void
+  canDrag: boolean
+  dragSourcePath: string | null
+  dropTargetPath: string | null
+  setDragSourcePath: Dispatch<SetStateAction<string | null>>
+  setDropTargetPath: Dispatch<SetStateAction<string | null>>
   toFileUrl: (path: string) => string
 }) {
   const {
@@ -3344,6 +3570,12 @@ function renderFolderNode(args: {
     onCreateChild,
     onRename,
     onDelete,
+    onMoveUnder,
+    canDrag,
+    dragSourcePath,
+    dropTargetPath,
+    setDragSourcePath,
+    setDropTargetPath,
     toFileUrl,
   } = args
 
@@ -3360,6 +3592,38 @@ function renderFolderNode(args: {
     .map((file) => (
       <SidebarMenuItem key={file.path}>
         <SidebarMenuButton
+          draggable={canDrag}
+          onDragStart={(event) => {
+            if (!canDrag) return
+            setDragSourcePath(file.path)
+            setDropTargetPath(null)
+            event.dataTransfer.effectAllowed = 'move'
+            event.dataTransfer.setData('text/plain', file.path)
+          }}
+          onDragOver={(event) => {
+            const sourcePath = dragSourcePath
+            if (!sourcePath || sourcePath === file.path) return
+            if (!canMovePathUnderParent(sourcePath, file.path)) return
+            event.preventDefault()
+            event.dataTransfer.dropEffect = 'move'
+            setDropTargetPath(file.path)
+          }}
+          onDragLeave={() => {
+            setDropTargetPath((prev) => (prev === file.path ? null : prev))
+          }}
+          onDrop={(event) => {
+            event.preventDefault()
+            const sourcePath = dragSourcePath || event.dataTransfer.getData('text/plain')
+            setDropTargetPath(null)
+            setDragSourcePath(null)
+            if (!sourcePath || sourcePath === file.path) return
+            if (!canMovePathUnderParent(sourcePath, file.path)) return
+            onMoveUnder(sourcePath, file.path)
+          }}
+          onDragEnd={() => {
+            setDropTargetPath(null)
+            setDragSourcePath(null)
+          }}
           isActive={selectedPath === file.path}
           onClick={() => {
             onSelectFile(file.path)
@@ -3374,8 +3638,9 @@ function renderFolderNode(args: {
           }}
           className={`[&>svg]:text-muted-foreground hover:[&_[data-tree-icon=default]]:opacity-0 hover:[&_[data-tree-icon=chevron]]:opacity-100 transition-colors ${
             highlightedPath === file.path ? 'bg-sidebar-accent/60' : ''
+          } ${
+            dropTargetPath === file.path ? 'ring-1 ring-primary ring-inset bg-sidebar-accent/40' : ''
           }`}
-          style={{ paddingLeft: `${depth * 14 + 8}px` }}
         >
           {subfolderByParentFilePath.has(file.path) ? (
             <span className="relative inline-flex size-4 shrink-0 items-center justify-center">
@@ -3463,6 +3728,12 @@ function renderFolderNode(args: {
                 onCreateChild,
                 onRename,
                 onDelete,
+                onMoveUnder,
+                canDrag,
+                dragSourcePath,
+                dropTargetPath,
+                setDragSourcePath,
+                setDropTargetPath,
                 toFileUrl,
               })}
             </SidebarMenuSub>
@@ -3486,7 +3757,6 @@ function renderFolderNode(args: {
         <SidebarMenuItem key={subfolder.path}>
           <SidebarMenuButton
             onClick={() => onToggleFolder(subfolder.path)}
-            style={{ paddingLeft: `${depth * 14 + 8}px` }}
           >
             {isExpanded ? (
               <ChevronDown className="size-3.5 text-muted-foreground" />
@@ -3510,6 +3780,12 @@ function renderFolderNode(args: {
                 onCreateChild,
                 onRename,
                 onDelete,
+                onMoveUnder,
+                canDrag,
+                dragSourcePath,
+                dropTargetPath,
+                setDragSourcePath,
+                setDropTargetPath,
                 toFileUrl,
               })}
             </SidebarMenuSub>
@@ -3665,6 +3941,34 @@ function basename(path: string): string {
 
 function fileLabel(path: string): string {
   return basename(path).replace(/\.md$/i, '')
+}
+
+function childDirectoryForPath(path: string): string {
+  return `${dirname(path) ? `${dirname(path)}/` : ''}${fileLabel(path)}`
+}
+
+function isPathInsideMovedSubtree(path: string, rootPath: string): boolean {
+  if (path === rootPath) return true
+  const rootDir = childDirectoryForPath(rootPath)
+  return path.startsWith(`${rootDir}/`)
+}
+
+function remapPathWithinMovedSubtree(path: string, oldPath: string, newPath: string): string {
+  if (path === oldPath) return newPath
+  const oldDir = childDirectoryForPath(oldPath)
+  const newDir = childDirectoryForPath(newPath)
+  const prefix = `${oldDir}/`
+  if (!path.startsWith(prefix)) return path
+  const suffix = path.slice(prefix.length)
+  return `${newDir}/${suffix}`
+}
+
+function canMovePathUnderParent(sourcePath: string, targetPath: string): boolean {
+  if (!sourcePath || !targetPath) return false
+  if (sourcePath === targetPath) return false
+  if (isPathInsideMovedSubtree(targetPath, sourcePath)) return false
+  const nextPath = `${childDirectoryForPath(targetPath)}/${fileLabel(sourcePath)}.md`
+  return nextPath !== sourcePath
 }
 
 function entryTitle(entry: MarkdownFile): string {
