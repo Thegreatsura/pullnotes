@@ -3302,7 +3302,7 @@ export function App() {
                 </div>
 
                 {tocItems.length > 1 ? (
-                  <div className="fixed right-6 z-30 hidden 2xl:block" style={{ top: `${tocTop}px` }}>
+                  <div className="fixed right-6 z-30 hidden lg:block" style={{ top: `${tocTop}px` }}>
                     <div className="group/toc relative">
                       <div className="flex justify-end transition-opacity duration-200 group-hover/toc:opacity-0 group-focus-within/toc:opacity-0">
                         <div className="flex flex-col items-end gap-3">
