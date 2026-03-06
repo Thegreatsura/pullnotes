@@ -523,6 +523,7 @@ export function App() {
   const searchPexels = useServerFn(searchPexelsServerFn)
   const uploadImageAsset = useServerFn(uploadImageAssetServerFn)
   const getRepoVisibilityFn = useServerFn(repoVisibilityServerFn)
+  const listMediaDirectory = useServerFn(listMediaDirectoryServerFn)
   const moveSubtree = useServerFn(moveSubtreeServerFn)
 
   const { data: authSession, isPending: authPending } = authClient.useSession()
@@ -575,7 +576,12 @@ export function App() {
   const [editorInstance, setEditorInstance] = useState<TiptapEditor | null>(null)
   const [isRepoPrivate, setIsRepoPrivate] = useState(false)
   const [bodyForEditor, setBodyForEditor] = useState('')
+  const [coverForDisplay, setCoverForDisplay] = useState('')
   const [coverLayoutTick, setCoverLayoutTick] = useState(0)
+  const mediaDirectoryCacheRef = useRef(
+    new Map<string, { expiresAt: number; files: Map<string, string> }>(),
+  )
+  const mediaDirectoryRequestRef = useRef(new Map<string, Promise<Map<string, string>>>())
   const latestDraftRef = useRef({
     title: '',
     icon: '',
@@ -584,6 +590,7 @@ export function App() {
   })
   const [tocTop, setTocTop] = useState(96)
   const [pendingImageUploads, setPendingImageUploads] = useState(0)
+  const [isCoverUploading, setIsCoverUploading] = useState(false)
   const [isSlashCommandOpen, setIsSlashCommandOpen] = useState(false)
   const [isAutosaveEnabled, setIsAutosaveEnabled] = useState(true)
   const [mergeReview, setMergeReview] = useState<MergeReviewState>({
@@ -619,6 +626,7 @@ export function App() {
     setTocItems([])
     setActiveTocId(null)
     setPendingImageUploads(0)
+    setIsCoverUploading(false)
     setIsSlashCommandOpen(false)
     setMergeReview({
       open: false,
@@ -661,6 +669,61 @@ export function App() {
     () => ({ owner, repo, branch, rootPath }),
     [owner, repo, branch, rootPath],
   )
+
+  const resolveRelativeImageDisplayUrl = async (source: string): Promise<string> => {
+    if (isNonRelativeUrl(source)) return source
+    if (!isRepoPrivate) {
+      return toGitHubImageUrl({
+        owner,
+        repo,
+        branch,
+        rootPath,
+        relativePath: source,
+      })
+    }
+
+    const relativePath = source.replace(/^\/+/, '')
+    const filename = getFileName(relativePath)
+    if (!filename) return source
+    const directoryPath = getParentPath(relativePath)
+    const key = directoryPath
+
+    const cached = mediaDirectoryCacheRef.current.get(key)
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.files.get(filename) || source
+    }
+
+    const pending = mediaDirectoryRequestRef.current.get(key)
+    if (pending) {
+      const files = await pending
+      return files.get(filename) || source
+    }
+
+    const request = (async () => {
+      const result = await listMediaDirectory({
+        data: {
+          target: activeTarget,
+          directoryPath,
+        },
+      })
+      const files = new Map<string, string>()
+      for (const item of result) {
+        if (!item.name || !item.url) continue
+        files.set(item.name, item.url)
+      }
+      mediaDirectoryCacheRef.current.set(key, {
+        expiresAt: Date.now() + 30_000,
+        files,
+      })
+      return files
+    })().finally(() => {
+      mediaDirectoryRequestRef.current.delete(key)
+    })
+
+    mediaDirectoryRequestRef.current.set(key, request)
+    const files = await request
+    return files.get(filename) || source
+  }
 
   const setSelectedPathAndUrl = (nextPath: string | null, replace = false) => {
     const search = {
@@ -717,18 +780,6 @@ export function App() {
   useEffect(() => {
     let cancelled = false
 
-    const resolveDisplayUrl = async (source: string): Promise<string> => {
-      if (isNonRelativeUrl(source)) return source
-      return toGitHubImageUrl({
-        owner,
-        repo,
-        branch,
-        rootPath,
-        relativePath: source,
-        privateRepo: isRepoPrivate,
-      })
-    }
-
     const build = async () => {
       const sources = getImageSourcesInMarkdown(body).filter((source) => !isNonRelativeUrl(source))
       if (!sources.length) {
@@ -738,7 +789,7 @@ export function App() {
 
       const unique = Array.from(new Set(sources))
       const resolved = await Promise.all(
-        unique.map(async (source) => [source, await resolveDisplayUrl(source)] as const),
+        unique.map(async (source) => [source, await resolveRelativeImageDisplayUrl(source)] as const),
       )
       if (cancelled) return
 
@@ -750,7 +801,29 @@ export function App() {
     return () => {
       cancelled = true
     }
-  }, [body, owner, repo, branch, rootPath, isRepoPrivate])
+  }, [body, owner, repo, branch, rootPath, isRepoPrivate, activeTarget, listMediaDirectory])
+
+  useEffect(() => {
+    let cancelled = false
+    const build = async () => {
+      const next = cover.trim()
+      if (!next) {
+        if (!cancelled) setCoverForDisplay('')
+        return
+      }
+      if (isNonRelativeUrl(next)) {
+        if (!cancelled) setCoverForDisplay(next)
+        return
+      }
+      if (!cancelled) setCoverForDisplay('')
+      const resolved = await resolveRelativeImageDisplayUrl(next)
+      if (!cancelled) setCoverForDisplay(resolved || next)
+    }
+    void build()
+    return () => {
+      cancelled = true
+    }
+  }, [cover, owner, repo, branch, rootPath, isRepoPrivate, activeTarget, listMediaDirectory])
   const filteredEmojiOptions = useMemo(() => {
     const query = emojiQuery.trim().toLowerCase()
     if (!query) return ICON_OPTIONS
@@ -837,6 +910,7 @@ export function App() {
     Boolean(isAuthenticated) &&
     isSelectedFileLoaded &&
     pendingImageUploads === 0 &&
+    !isCoverUploading &&
     !isSaving &&
     !isLoadingRepo &&
     !titleMissing &&
@@ -912,8 +986,8 @@ export function App() {
   }, [selectedPath])
 
   const leaveBlocker = useBlocker({
-    shouldBlockFn: () => (isDirty || pendingImageUploads > 0) && !isSaving,
-    enableBeforeUnload: isDirty || pendingImageUploads > 0,
+    shouldBlockFn: () => (isDirty || pendingImageUploads > 0 || isCoverUploading) && !isSaving,
+    enableBeforeUnload: isDirty || pendingImageUploads > 0 || isCoverUploading,
     withResolver: true,
   })
 
@@ -1333,18 +1407,14 @@ export function App() {
     })
 
     const relativePath = uploaded.relativePath
-    const defaultEditorPath = toGitHubImageUrl({
-      owner,
-      repo,
-      branch,
-      rootPath,
-      relativePath,
-      privateRepo: isRepoPrivate,
-    })
+    const directoryPath = getParentPath(relativePath)
+    mediaDirectoryCacheRef.current.delete(directoryPath)
+    mediaDirectoryRequestRef.current.delete(directoryPath)
+    const editorPath = await resolveRelativeImageDisplayUrl(relativePath)
 
     return {
       relativePath,
-      editorPath: defaultEditorPath,
+      editorPath,
     }
   }
 
@@ -1371,7 +1441,11 @@ export function App() {
 
   const handleSetCover = (nextCover: string) => {
     const trimmed = nextCover.trim()
-    if (trimmed && !isAllowedCoverUrl(trimmed)) {
+    if (trimmed && !isNonRelativeUrl(trimmed) && !trimmed.startsWith('/')) {
+      setErrorMessage('Cover path must start with /.')
+      return
+    }
+    if (trimmed && isNonRelativeUrl(trimmed) && !isAllowedCoverUrl(trimmed)) {
       setErrorMessage('Cover URL must come from Pexels or Unsplash.')
       return
     }
@@ -1387,20 +1461,28 @@ export function App() {
     const file = await chooseImageFile()
     if (!file) return
 
+    const previousCover = cover
+    const previewUrl = URL.createObjectURL(file)
+    setCover(previewUrl)
+    setIsCoverPopoverOpen(false)
+    setIsCoverUploading(true)
     const toastId = toast.loading('Uploading cover...')
     try {
       const uploaded = await uploadImageToRepo(file)
-      if (uploaded.editorPath !== cover) {
+      if (uploaded.relativePath !== previousCover) {
         setHasUserEdits(true)
       }
-      setCover(uploaded.editorPath)
+      setCover(uploaded.relativePath)
       setErrorMessage(null)
-      setIsCoverPopoverOpen(false)
       toast.success('Cover uploaded', { id: toastId })
     } catch (error) {
       const message = errorToMessage(error)
+      setCover(previousCover)
       setErrorMessage(message)
       showErrorToast(toastId, message)
+    } finally {
+      URL.revokeObjectURL(previewUrl)
+      setIsCoverUploading(false)
     }
   }
 
@@ -1690,12 +1772,12 @@ export function App() {
       }
 
       const shouldSave = window.confirm(
-        pendingImageUploads > 0
+        pendingImageUploads > 0 || isCoverUploading
           ? 'Images are still uploading. Press OK to stay on this page, or Cancel to leave now.'
           : 'You have unsaved changes. Press OK to save before leaving, or Cancel to leave without saving.',
       )
 
-      if (pendingImageUploads > 0) {
+      if (pendingImageUploads > 0 || isCoverUploading) {
         if (shouldSave) {
           leaveBlocker.reset?.()
         } else {
@@ -1716,7 +1798,7 @@ export function App() {
       else leaveBlocker.reset?.()
       isResolvingLeaveRef.current = false
     })()
-  }, [leaveBlocker, handleSave, pendingImageUploads])
+  }, [leaveBlocker, handleSave, pendingImageUploads, isCoverUploading])
 
   const handleCreate = async () => {
     const nextTitle = window.prompt('Title')
@@ -2653,7 +2735,7 @@ export function App() {
                         type="button"
                         variant="ghost"
                         size="sm"
-                        className="hidden h-7 items-center gap-2 px-2 text-xs sm:flex text-muted-foreground"
+                        className="hidden h-7 items-center gap-2 px-2 text-xs sm:flex"
                       >
                         {recentCommits[0].authorAvatarUrl ? (
                           <img
@@ -2825,13 +2907,22 @@ export function App() {
               <div ref={editorRegionRef} className={`w-full pb-10 ${cover ? '' : 'pt-20'}`}>
                 {cover ? (
                   <div className="group/cover relative mb-2 w-full">
-                    <img
-                      src={cover}
-                      alt="Cover"
-                      onLoad={() => setCoverLayoutTick((value) => value + 1)}
-                      onError={() => setCoverLayoutTick((value) => value + 1)}
-                      className="h-64 w-full object-cover"
-                    />
+                    {(() => {
+                      const rawCover = cover.trim()
+                      const coverSrc = isNonRelativeUrl(rawCover) ? rawCover : coverForDisplay.trim()
+                      if (!coverSrc) {
+                        return <div className={`h-64 w-full bg-muted ${isCoverUploading ? 'animate-pulse' : ''}`} />
+                      }
+                      return (
+                        <img
+                          src={coverSrc}
+                          alt="Cover"
+                          onLoad={() => setCoverLayoutTick((value) => value + 1)}
+                          onError={() => setCoverLayoutTick((value) => value + 1)}
+                          className={`h-64 w-full object-cover ${isCoverUploading ? 'animate-pulse' : ''}`}
+                        />
+                      )
+                    })()}
                     <div className="absolute top-3 right-3 flex items-center gap-2 opacity-0 transition-opacity group-hover/cover:opacity-100">
                       <Popover
                         open={isCoverPopoverOpen}
@@ -2848,7 +2939,7 @@ export function App() {
                             type="button"
                             variant="secondary"
                             size="sm"
-                            className="h-7 px-2 text-xs text-muted-foreground"
+                            className="h-7 px-2 text-xs"
                           >
                             Change cover
                           </Button>
@@ -2913,7 +3004,7 @@ export function App() {
                         type="button"
                         variant="secondary"
                         size="sm"
-                        className="h-7 px-2 text-xs text-muted-foreground"
+                        className="h-7 px-2 text-xs"
                         onClick={() => setCover('')}
                       >
                         Remove cover
