@@ -24,6 +24,7 @@ import { AboutPullNotesDialog } from '#/components/about-pullnotes-dialog'
 import { Avatar, AvatarFallback, AvatarImage } from '#/components/ui/avatar'
 import {
   Breadcrumb,
+  BreadcrumbEllipsis,
   BreadcrumbItem,
   BreadcrumbLink,
   BreadcrumbList,
@@ -50,6 +51,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '#/components/ui/popover
 import { ScrollArea } from '#/components/ui/scroll-area'
 import { Separator } from '#/components/ui/separator'
 import { Skeleton } from '#/components/ui/skeleton'
+import { Switch } from '#/components/ui/switch'
 import {
   Sidebar,
   SidebarContent,
@@ -457,6 +459,8 @@ export function App() {
   const [tocTop, setTocTop] = useState(96)
   const [pendingImageUploads, setPendingImageUploads] = useState(0)
   const [isSlashCommandOpen, setIsSlashCommandOpen] = useState(false)
+  const [isAutosaveEnabled, setIsAutosaveEnabled] = useState(true)
+  const [isAutosavePausedForReview, setIsAutosavePausedForReview] = useState(false)
 
   useEffect(() => {
     return () => {
@@ -831,6 +835,10 @@ export function App() {
       }
     })
   }, [selectedPath, fileMap])
+  const currentBreadcrumb = breadcrumbs[breadcrumbs.length - 1] ?? null
+  const hasBreadcrumbOverflow = breadcrumbs.length > 3
+  const leadingBreadcrumb = hasBreadcrumbOverflow ? breadcrumbs[0] ?? null : null
+  const hiddenBreadcrumbs = hasBreadcrumbOverflow ? breadcrumbs.slice(1, -1) : []
   const loadRecentCommits = async () => {
     try {
       const commits = await getRecentCommits({
@@ -1021,6 +1029,148 @@ export function App() {
     }
   }, [selectedPath, getFile, isAuthenticated, activeTarget])
 
+  useEffect(() => {
+    if (
+      !isAuthenticated ||
+      !selectedPath ||
+      !hasLoadedFile ||
+      loadedPath !== selectedPath ||
+      isLoadingFile ||
+      isLoadingRepo
+    ) {
+      return
+    }
+
+    let cancelled = false
+    let inFlight = false
+
+    const checkRemoteChanges = async () => {
+      if (cancelled || inFlight || isSaving) return
+      inFlight = true
+
+      try {
+        const nextFiles = await listFiles({
+          data: {
+            target: activeTarget,
+          },
+        })
+        if (cancelled) return
+
+        const selectedMeta = nextFiles.find((file) => file.path === selectedPath)
+        if (!selectedMeta) return
+        if (!sha || selectedMeta.sha === sha) return
+
+        const remote = await getFile({
+          data: {
+            target: activeTarget,
+            path: selectedPath,
+          },
+        })
+        if (cancelled) return
+        if (remote.sha === sha) return
+
+        setFiles(nextFiles)
+
+        if (!isDirty) {
+          setTitle(remote.title)
+          setIcon(remote.icon)
+          setCover(remote.cover)
+          setBody(remote.body)
+          setSha(remote.sha)
+          setSavedTitle(remote.title)
+          setSavedIcon(remote.icon)
+          setSavedCover(remote.cover)
+          setSavedBody(remote.body)
+          setHasUserEdits(false)
+          writeCachedMarkdownFile(activeTarget, selectedPath, {
+            sha: remote.sha,
+            title: remote.title,
+            icon: remote.icon,
+            cover: remote.cover,
+            body: remote.body,
+          })
+          return
+        }
+
+        const localDraft = latestDraftRef.current
+        const mergedTitle = mergeScalarField({
+          base: savedTitle,
+          local: localDraft.title,
+          remote: remote.title,
+        })
+        const mergedIcon = mergeScalarField({
+          base: savedIcon,
+          local: localDraft.icon,
+          remote: remote.icon,
+        })
+        const mergedCover = mergeScalarField({
+          base: savedCover,
+          local: localDraft.cover,
+          remote: remote.cover,
+        })
+        const mergedBody = mergeBodyField({
+          base: savedBody,
+          local: localDraft.body,
+          remote: remote.body,
+        })
+
+        setTitle(mergedTitle.value)
+        setIcon(mergedIcon.value)
+        setCover(mergedCover.value)
+        setBody(mergedBody.value)
+        setSha(remote.sha)
+        setSavedTitle(remote.title)
+        setSavedIcon(remote.icon)
+        setSavedCover(remote.cover)
+        setSavedBody(remote.body)
+        setHasUserEdits(true)
+
+        const hasConflict =
+          mergedTitle.conflict || mergedIcon.conflict || mergedCover.conflict || mergedBody.conflict
+
+        if (hasConflict) {
+          setIsAutosavePausedForReview(true)
+          toast.warning(
+            'Remote and local changes overlapped. Kept your local content where needed and paused autosave until your next manual save.',
+          )
+        } else {
+          toast('Remote changes were merged into your local draft.')
+        }
+      } catch {
+        // Silent background sync failure.
+      } finally {
+        inFlight = false
+      }
+    }
+
+    const interval = window.setInterval(() => {
+      void checkRemoteChanges()
+    }, 3000)
+    void checkRemoteChanges()
+
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [
+    isAuthenticated,
+    selectedPath,
+    hasLoadedFile,
+    loadedPath,
+    isLoadingFile,
+    isLoadingRepo,
+    isSaving,
+    sha,
+    isDirty,
+    savedTitle,
+    savedIcon,
+    savedCover,
+    savedBody,
+    activeTarget,
+    listFiles,
+    getFile,
+  ])
+
   const focusEditor = () => {
     const editorEl = editorRegionRef.current?.querySelector('.ProseMirror') as HTMLElement | null
     editorEl?.focus()
@@ -1187,51 +1337,141 @@ export function App() {
 
   const handleSave = async (options?: { silent?: boolean }): Promise<boolean> => {
     if (!selectedPath) return false
-    const draftAtStart = latestDraftRef.current
-    const cleanTitle = draftAtStart.title.trim()
-    const persistedBody = mapImageSourcesInMarkdown(draftAtStart.body, (src) =>
-      fromRenderedImageUrl({
-        owner,
-        repo,
-        branch,
-        rootPath,
-        renderedPath: src,
-      }),
-    )
-    if (!cleanTitle) {
-      setErrorMessage('Title is required.')
-      return false
-    }
-
     setIsSaving(true)
     setErrorMessage(null)
     const toastId = options?.silent ? null : toast.loading('Saving changes...')
 
+    const buildPersistedBody = (nextBody: string) =>
+      mapImageSourcesInMarkdown(nextBody, (src) =>
+        fromRenderedImageUrl({
+          owner,
+          repo,
+          branch,
+          rootPath,
+          renderedPath: src,
+        }),
+      )
+
+    const didEqualDraft = (
+      a: { title: string; icon: string; cover: string; body: string },
+      b: { title: string; icon: string; cover: string; body: string },
+    ) =>
+      a.title.trim() === b.title.trim() &&
+      a.icon.trim() === b.icon.trim() &&
+      a.cover.trim() === b.cover.trim() &&
+      normalizeBodyForCompare(a.body) === normalizeBodyForCompare(b.body)
+
     try {
-      const result = await saveFile({
-        data: {
-          target: activeTarget,
-          path: selectedPath,
-          title: cleanTitle,
-          icon: draftAtStart.icon,
-          cover: draftAtStart.cover,
-          body: persistedBody,
-          sha,
-        },
-      })
+      const draftAtStart = latestDraftRef.current
+      const cleanTitle = draftAtStart.title.trim()
+      if (!cleanTitle) {
+        setErrorMessage('Title is required.')
+        return false
+      }
+
+      const draftForSave = {
+        title: cleanTitle,
+        icon: draftAtStart.icon,
+        cover: draftAtStart.cover,
+        body: draftAtStart.body,
+      }
+
+      let effectiveDraft = draftForSave
+      let effectiveSha = sha
+      let hadConflictMerge = false
+
+      const attemptSave = async (nextDraft: typeof draftForSave, nextSha: string | undefined) =>
+        saveFile({
+          data: {
+            target: activeTarget,
+            path: selectedPath,
+            title: nextDraft.title.trim(),
+            icon: nextDraft.icon,
+            cover: nextDraft.cover,
+            body: buildPersistedBody(nextDraft.body),
+            sha: nextSha,
+          },
+        })
+
+      let result
+      try {
+        result = await attemptSave(effectiveDraft, effectiveSha)
+      } catch (error) {
+        if (!isShaConflictError(error)) {
+          throw error
+        }
+
+        const remote = await getFile({
+          data: {
+            target: activeTarget,
+            path: selectedPath,
+          },
+        })
+
+        const localDraft = latestDraftRef.current
+        const mergedTitle = mergeScalarField({
+          base: savedTitle,
+          local: localDraft.title,
+          remote: remote.title,
+        })
+        const mergedIcon = mergeScalarField({
+          base: savedIcon,
+          local: localDraft.icon,
+          remote: remote.icon,
+        })
+        const mergedCover = mergeScalarField({
+          base: savedCover,
+          local: localDraft.cover,
+          remote: remote.cover,
+        })
+        const mergedBody = mergeBodyField({
+          base: savedBody,
+          local: localDraft.body,
+          remote: remote.body,
+        })
+
+        effectiveDraft = {
+          title: mergedTitle.value.trim(),
+          icon: mergedIcon.value,
+          cover: mergedCover.value,
+          body: mergedBody.value,
+        }
+        if (!effectiveDraft.title) {
+          setErrorMessage('Title is required.')
+          return false
+        }
+
+        hadConflictMerge =
+          mergedTitle.conflict || mergedIcon.conflict || mergedCover.conflict || mergedBody.conflict
+
+        setTitle(effectiveDraft.title)
+        setIcon(effectiveDraft.icon)
+        setCover(effectiveDraft.cover)
+        setBody(effectiveDraft.body)
+        setSha(remote.sha)
+        setSavedTitle(remote.title)
+        setSavedIcon(remote.icon)
+        setSavedCover(remote.cover)
+        setSavedBody(remote.body)
+        setHasUserEdits(true)
+
+        effectiveSha = remote.sha
+        result = await attemptSave(effectiveDraft, effectiveSha)
+      }
+
+      if (!result) return false
 
       setSha(result.sha)
-      setSavedTitle(cleanTitle)
-      setSavedIcon(draftAtStart.icon)
-      setSavedCover(draftAtStart.cover)
-      setSavedBody(draftAtStart.body)
+      setSavedTitle(effectiveDraft.title)
+      setSavedIcon(effectiveDraft.icon)
+      setSavedCover(effectiveDraft.cover)
+      setSavedBody(effectiveDraft.body)
       const latestDraft = latestDraftRef.current
-      const unchangedSinceSaveStart =
-        latestDraft.title.trim() === cleanTitle &&
-        latestDraft.icon.trim() === draftAtStart.icon.trim() &&
-        latestDraft.cover.trim() === draftAtStart.cover.trim() &&
-        normalizeBodyForCompare(latestDraft.body) === normalizeBodyForCompare(draftAtStart.body)
-      setHasUserEdits(!unchangedSinceSaveStart)
+      const unchangedSinceSave = didEqualDraft(latestDraft, effectiveDraft)
+      setHasUserEdits(!unchangedSinceSave)
+      if (!options?.silent) {
+        setIsAutosavePausedForReview(false)
+      }
 
       setFiles((previous) =>
         previous.map((file) =>
@@ -1239,9 +1479,9 @@ export function App() {
             ? {
                 ...file,
                 sha: result.sha,
-                title: cleanTitle,
-                icon: draftAtStart.icon,
-                cover: draftAtStart.cover,
+                title: effectiveDraft.title,
+                icon: effectiveDraft.icon,
+                cover: effectiveDraft.cover,
               }
             : file,
         ),
@@ -1249,14 +1489,14 @@ export function App() {
 
       writeCachedMarkdownFile(activeTarget, selectedPath, {
         sha: result.sha,
-        title: cleanTitle,
-        icon: draftAtStart.icon,
-        cover: draftAtStart.cover,
-        body: draftAtStart.body,
+        title: effectiveDraft.title,
+        icon: effectiveDraft.icon,
+        cover: effectiveDraft.cover,
+        body: effectiveDraft.body,
       })
       await loadRecentCommits()
       if (toastId !== null) {
-        toast.success('Saved', { id: toastId })
+        toast.success(hadConflictMerge ? 'Saved after merging remote updates' : 'Saved', { id: toastId })
       }
       return true
     } catch (error) {
@@ -1316,14 +1556,14 @@ export function App() {
   }, [isAuthenticated, selectedPath, isSaving, isLoadingFile, isDirty, titleMissing, handleSave])
 
   useEffect(() => {
-    if (!canSave || isSaving || isSlashCommandOpen) return
+    if (!canSave || isSaving || isSlashCommandOpen || !isAutosaveEnabled || isAutosavePausedForReview) return
 
     const timeout = setTimeout(() => {
       void handleSave({ silent: true })
     }, 3000)
 
     return () => clearTimeout(timeout)
-  }, [canSave, isSaving, isSlashCommandOpen, handleSave])
+  }, [canSave, isSaving, isSlashCommandOpen, isAutosaveEnabled, isAutosavePausedForReview, handleSave])
 
   useEffect(() => {
     if (leaveBlocker.status !== 'blocked' || isResolvingLeaveRef.current) return
@@ -2076,45 +2316,155 @@ export function App() {
                 <SidebarTrigger className="md:hidden" />
                 <Separator orientation="vertical" className="mr-2 data-[orientation=vertical]:h-4 md:hidden" />
                 {selectedPath ? (
-                  <Breadcrumb>
-                    <BreadcrumbList className="gap-1 text-sm">
-                      {breadcrumbs.map((crumb, index) => {
-                        const isLast = index === breadcrumbs.length - 1
-                        return (
-                          <Fragment key={crumb.path}>
-                            <BreadcrumbItem className="min-w-0">
-                              {isLast ? (
-                                <BreadcrumbPage className="flex min-w-0 items-center gap-1">
+                  <>
+                    <div className="flex min-w-0 items-center gap-1 lg:hidden">
+                      {breadcrumbs.length > 1 ? (
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button type="button" variant="ghost" size="icon" className="size-7 shrink-0">
+                              <BreadcrumbEllipsis className="size-7" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="start" side="bottom" sideOffset={6}>
+                            {breadcrumbs.map((crumb, index) => {
+                              const isLast = index === breadcrumbs.length - 1
+                              return (
+                                <DropdownMenuItem
+                                  key={`mobile-breadcrumb-${crumb.path}`}
+                                  onSelect={() => {
+                                    if (!isLast) setSelectedPathAndUrl(crumb.path)
+                                  }}
+                                  disabled={isLast}
+                                >
                                   {crumb.icon ? (
                                     <span className="inline-flex size-4 shrink-0 items-center justify-center text-sm leading-none">
                                       {crumb.icon}
                                     </span>
                                   ) : null}
                                   <span className="truncate">{crumb.label}</span>
-                                </BreadcrumbPage>
-                              ) : (
-                                <BreadcrumbLink asChild>
-                                  <button
-                                    type="button"
-                                    onClick={() => setSelectedPathAndUrl(crumb.path)}
-                                    className="flex min-w-0 items-center gap-1"
-                                  >
-                                    {crumb.icon ? (
-                                      <span className="inline-flex size-4 shrink-0 items-center justify-center text-sm leading-none">
-                                        {crumb.icon}
-                                      </span>
-                                    ) : null}
-                                    <span className="truncate">{crumb.label}</span>
-                                  </button>
-                                </BreadcrumbLink>
-                              )}
-                            </BreadcrumbItem>
-                            {!isLast ? <BreadcrumbSeparator /> : null}
-                          </Fragment>
-                        )
-                      })}
-                    </BreadcrumbList>
-                  </Breadcrumb>
+                                </DropdownMenuItem>
+                              )
+                            })}
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      ) : null}
+                      {currentBreadcrumb ? (
+                        <span className="flex min-w-0 items-center gap-1 text-sm font-medium">
+                          {currentBreadcrumb.icon ? (
+                            <span className="inline-flex size-4 shrink-0 items-center justify-center text-sm leading-none">
+                              {currentBreadcrumb.icon}
+                            </span>
+                          ) : null}
+                          <span className="max-w-[min(52vw,20rem)] truncate">{currentBreadcrumb.label}</span>
+                        </span>
+                      ) : null}
+                    </div>
+
+                    <Breadcrumb className="hidden lg:block">
+                      <BreadcrumbList className="gap-1 text-sm">
+                        {!hasBreadcrumbOverflow
+                          ? breadcrumbs.map((crumb, index) => {
+                              const isLast = index === breadcrumbs.length - 1
+                              return (
+                                <Fragment key={crumb.path}>
+                                  <BreadcrumbItem className="min-w-0">
+                                    {isLast ? (
+                                      <BreadcrumbPage className="flex min-w-0 items-center gap-1">
+                                        {crumb.icon ? (
+                                          <span className="inline-flex size-4 shrink-0 items-center justify-center text-sm leading-none">
+                                            {crumb.icon}
+                                          </span>
+                                        ) : null}
+                                        <span className="max-w-[18rem] truncate">{crumb.label}</span>
+                                      </BreadcrumbPage>
+                                    ) : (
+                                      <BreadcrumbLink asChild>
+                                        <button
+                                          type="button"
+                                          onClick={() => setSelectedPathAndUrl(crumb.path)}
+                                          className="flex min-w-0 items-center gap-1"
+                                        >
+                                          {crumb.icon ? (
+                                            <span className="inline-flex size-4 shrink-0 items-center justify-center text-sm leading-none">
+                                              {crumb.icon}
+                                            </span>
+                                          ) : null}
+                                          <span className="max-w-[16rem] truncate">{crumb.label}</span>
+                                        </button>
+                                      </BreadcrumbLink>
+                                    )}
+                                  </BreadcrumbItem>
+                                  {!isLast ? <BreadcrumbSeparator /> : null}
+                                </Fragment>
+                              )
+                            })
+                          : (
+                              <>
+                                {leadingBreadcrumb ? (
+                                  <>
+                                    <BreadcrumbItem className="min-w-0">
+                                      <BreadcrumbLink asChild>
+                                        <button
+                                          type="button"
+                                          onClick={() => setSelectedPathAndUrl(leadingBreadcrumb.path)}
+                                          className="flex min-w-0 items-center gap-1"
+                                        >
+                                          {leadingBreadcrumb.icon ? (
+                                            <span className="inline-flex size-4 shrink-0 items-center justify-center text-sm leading-none">
+                                              {leadingBreadcrumb.icon}
+                                            </span>
+                                          ) : null}
+                                          <span className="max-w-[14rem] truncate">{leadingBreadcrumb.label}</span>
+                                        </button>
+                                      </BreadcrumbLink>
+                                    </BreadcrumbItem>
+                                    <BreadcrumbSeparator />
+                                  </>
+                                ) : null}
+
+                                <BreadcrumbItem>
+                                  <DropdownMenu>
+                                    <DropdownMenuTrigger asChild>
+                                      <Button type="button" variant="ghost" size="icon" className="size-7">
+                                        <BreadcrumbEllipsis className="size-7" />
+                                      </Button>
+                                    </DropdownMenuTrigger>
+                                    <DropdownMenuContent align="start" side="bottom" sideOffset={6}>
+                                      {hiddenBreadcrumbs.map((crumb) => (
+                                        <DropdownMenuItem
+                                          key={`desktop-breadcrumb-${crumb.path}`}
+                                          onSelect={() => setSelectedPathAndUrl(crumb.path)}
+                                        >
+                                          {crumb.icon ? (
+                                            <span className="inline-flex size-4 shrink-0 items-center justify-center text-sm leading-none">
+                                              {crumb.icon}
+                                            </span>
+                                          ) : null}
+                                          <span className="truncate">{crumb.label}</span>
+                                        </DropdownMenuItem>
+                                      ))}
+                                    </DropdownMenuContent>
+                                  </DropdownMenu>
+                                </BreadcrumbItem>
+                                <BreadcrumbSeparator />
+
+                                {currentBreadcrumb ? (
+                                  <BreadcrumbItem className="min-w-0">
+                                    <BreadcrumbPage className="flex min-w-0 items-center gap-1">
+                                      {currentBreadcrumb.icon ? (
+                                        <span className="inline-flex size-4 shrink-0 items-center justify-center text-sm leading-none">
+                                          {currentBreadcrumb.icon}
+                                        </span>
+                                      ) : null}
+                                      <span className="max-w-[18rem] truncate">{currentBreadcrumb.label}</span>
+                                    </BreadcrumbPage>
+                                  </BreadcrumbItem>
+                                ) : null}
+                              </>
+                            )}
+                      </BreadcrumbList>
+                    </Breadcrumb>
+                  </>
                 ) : (
                   <div className="truncate text-sm font-medium">
                     {isLoadingRepo ? <Skeleton className="h-5 w-30 rounded-md" /> : 'No file selected'}
@@ -2170,7 +2520,20 @@ export function App() {
                     </DropdownMenuContent>
                   </DropdownMenu>
                 ) : null}
-                <div className="inline-flex items-center">
+                <div className="inline-flex items-center gap-2">
+                  <label
+                    htmlFor="autosave-switch"
+                    className={`text-xs ${isSaving ? 'cursor-not-allowed text-muted-foreground' : 'cursor-pointer text-foreground'}`}
+                  >
+                    Autosave
+                  </label>
+                  <Switch
+                    id="autosave-switch"
+                    checked={isAutosaveEnabled}
+                    onCheckedChange={setIsAutosaveEnabled}
+                    disabled={isSaving}
+                    aria-label="Toggle autosave"
+                  />
                   <Button
                     type="button"
                     size="sm"
@@ -2198,6 +2561,9 @@ export function App() {
                     <Undo2 className="size-3.5" />
                   </Button>
                 </div>
+                {isAutosaveEnabled && isAutosavePausedForReview ? (
+                  <span className="text-xs text-amber-600">Autosave paused until next manual save</span>
+                ) : null}
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
@@ -3217,6 +3583,319 @@ function normalizeBodyForCompare(value: string): string {
   return value.replace(/\r\n/g, '\n').trimEnd()
 }
 
+function mergeScalarField(input: { base: string; local: string; remote: string }): {
+  value: string
+  conflict: boolean
+} {
+  if (input.local === input.remote) {
+    return { value: input.local, conflict: false }
+  }
+  if (input.local === input.base) {
+    return { value: input.remote, conflict: false }
+  }
+  if (input.remote === input.base) {
+    return { value: input.local, conflict: false }
+  }
+  return {
+    value: input.local,
+    conflict: true,
+  }
+}
+
+function mergeBodyField(input: { base: string; local: string; remote: string }): {
+  value: string
+  conflict: boolean
+} {
+  if (input.local === input.remote) {
+    return { value: input.local, conflict: false }
+  }
+  if (input.local === input.base) {
+    return { value: input.remote, conflict: false }
+  }
+  if (input.remote === input.base) {
+    return { value: input.local, conflict: false }
+  }
+
+  const baseLines = splitLines(input.base)
+  const localChunks = diffLinesToChunks(baseLines, splitLines(input.local))
+  const remoteChunks = diffLinesToChunks(baseLines, splitLines(input.remote))
+
+  const merged = mergeLineChunks(baseLines, localChunks, remoteChunks)
+  if (!merged.conflict) {
+    return {
+      value: merged.lines.join('\n'),
+      conflict: false,
+    }
+  }
+
+  return {
+    value: input.local,
+    conflict: true,
+  }
+}
+
+type LineChunk = {
+  baseStart: number
+  baseEnd: number
+  replacement: string[]
+}
+
+function splitLines(value: string): string[] {
+  return value.split('\n')
+}
+
+function diffLinesToChunks(base: string[], target: string[]): LineChunk[] {
+  const ops = diffOps(base, target)
+  const chunks: LineChunk[] = []
+
+  let baseIndex = 0
+  let inChunk = false
+  let chunkBaseStart = 0
+  let chunkReplacement: string[] = []
+
+  const closeChunk = () => {
+    if (!inChunk) return
+    chunks.push({
+      baseStart: chunkBaseStart,
+      baseEnd: baseIndex,
+      replacement: chunkReplacement,
+    })
+    inChunk = false
+    chunkReplacement = []
+  }
+
+  for (const op of ops) {
+    if (op.type === 'equal') {
+      closeChunk()
+      baseIndex += 1
+      continue
+    }
+
+    if (!inChunk) {
+      inChunk = true
+      chunkBaseStart = baseIndex
+    }
+
+    if (op.type === 'delete') {
+      baseIndex += 1
+      continue
+    }
+
+    chunkReplacement.push(op.value)
+  }
+
+  closeChunk()
+  return chunks
+}
+
+function diffOps(base: string[], target: string[]): Array<{
+  type: 'equal' | 'insert' | 'delete'
+  value: string
+}> {
+  const n = base.length
+  const m = target.length
+  const dp = Array.from({ length: n + 1 }, () => Array<number>(m + 1).fill(0))
+
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      if (base[i] === target[j]) {
+        dp[i][j] = dp[i + 1][j + 1] + 1
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1])
+      }
+    }
+  }
+
+  const ops: Array<{
+    type: 'equal' | 'insert' | 'delete'
+    value: string
+  }> = []
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (base[i] === target[j]) {
+      ops.push({ type: 'equal', value: base[i] })
+      i += 1
+      j += 1
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      ops.push({ type: 'delete', value: base[i] })
+      i += 1
+    } else {
+      ops.push({ type: 'insert', value: target[j] })
+      j += 1
+    }
+  }
+  while (i < n) {
+    ops.push({ type: 'delete', value: base[i] })
+    i += 1
+  }
+  while (j < m) {
+    ops.push({ type: 'insert', value: target[j] })
+    j += 1
+  }
+  return ops
+}
+
+function mergeLineChunks(
+  base: string[],
+  localChunks: LineChunk[],
+  remoteChunks: LineChunk[],
+): { lines: string[]; conflict: boolean } {
+  const output: string[] = []
+  let baseCursor = 0
+  let localIndex = 0
+  let remoteIndex = 0
+  let hasConflict = false
+
+  const appendBase = (start: number, end: number) => {
+    if (end <= start) return
+    output.push(...base.slice(start, end))
+  }
+
+  const appendChunk = (chunk: LineChunk) => {
+    appendBase(baseCursor, chunk.baseStart)
+    output.push(...chunk.replacement)
+    baseCursor = chunk.baseEnd
+  }
+
+  while (localIndex < localChunks.length || remoteIndex < remoteChunks.length) {
+    const local = localChunks[localIndex]
+    const remote = remoteChunks[remoteIndex]
+
+    if (!local) {
+      appendChunk(remote)
+      remoteIndex += 1
+      continue
+    }
+
+    if (!remote) {
+      appendChunk(local)
+      localIndex += 1
+      continue
+    }
+
+    if (!rangesOverlapOrTouch(local, remote)) {
+      if (
+        local.baseStart < remote.baseStart ||
+        (local.baseStart === remote.baseStart && local.baseEnd <= remote.baseEnd)
+      ) {
+        appendChunk(local)
+        localIndex += 1
+      } else {
+        appendChunk(remote)
+        remoteIndex += 1
+      }
+      continue
+    }
+
+    let clusterStart = Math.min(local.baseStart, remote.baseStart)
+    let clusterEnd = Math.max(local.baseEnd, remote.baseEnd)
+    const localCluster: LineChunk[] = []
+    const remoteCluster: LineChunk[] = []
+
+    let expanded = true
+    while (expanded) {
+      expanded = false
+      while (
+        localIndex < localChunks.length &&
+        chunkTouchesInterval(localChunks[localIndex], clusterStart, clusterEnd)
+      ) {
+        const chunk = localChunks[localIndex]
+        localCluster.push(chunk)
+        clusterStart = Math.min(clusterStart, chunk.baseStart)
+        clusterEnd = Math.max(clusterEnd, chunk.baseEnd)
+        localIndex += 1
+        expanded = true
+      }
+      while (
+        remoteIndex < remoteChunks.length &&
+        chunkTouchesInterval(remoteChunks[remoteIndex], clusterStart, clusterEnd)
+      ) {
+        const chunk = remoteChunks[remoteIndex]
+        remoteCluster.push(chunk)
+        clusterStart = Math.min(clusterStart, chunk.baseStart)
+        clusterEnd = Math.max(clusterEnd, chunk.baseEnd)
+        remoteIndex += 1
+        expanded = true
+      }
+    }
+
+    appendBase(baseCursor, clusterStart)
+
+    const baseSlice = base.slice(clusterStart, clusterEnd)
+    const localSlice = applyChunksToBaseSlice(base, clusterStart, clusterEnd, localCluster)
+    const remoteSlice = applyChunksToBaseSlice(base, clusterStart, clusterEnd, remoteCluster)
+
+    if (stringArraysEqual(localSlice, remoteSlice)) {
+      output.push(...localSlice)
+    } else if (stringArraysEqual(localSlice, baseSlice)) {
+      output.push(...remoteSlice)
+    } else if (stringArraysEqual(remoteSlice, baseSlice)) {
+      output.push(...localSlice)
+    } else {
+      hasConflict = true
+      output.push(...localSlice)
+    }
+
+    baseCursor = clusterEnd
+  }
+
+  appendBase(baseCursor, base.length)
+  return { lines: output, conflict: hasConflict }
+}
+
+function applyChunksToBaseSlice(
+  base: string[],
+  start: number,
+  end: number,
+  chunks: LineChunk[],
+): string[] {
+  const output: string[] = []
+  let cursor = start
+
+  for (const chunk of chunks) {
+    output.push(...base.slice(cursor, chunk.baseStart))
+    output.push(...chunk.replacement)
+    cursor = chunk.baseEnd
+  }
+
+  output.push(...base.slice(cursor, end))
+  return output
+}
+
+function rangesOverlapOrTouch(a: LineChunk, b: LineChunk): boolean {
+  const aEmpty = a.baseStart === a.baseEnd
+  const bEmpty = b.baseStart === b.baseEnd
+
+  if (aEmpty && bEmpty) {
+    return a.baseStart === b.baseStart
+  }
+  if (aEmpty) {
+    return a.baseStart >= b.baseStart && a.baseStart <= b.baseEnd
+  }
+  if (bEmpty) {
+    return b.baseStart >= a.baseStart && b.baseStart <= a.baseEnd
+  }
+
+  return a.baseStart < b.baseEnd && b.baseStart < a.baseEnd
+}
+
+function chunkTouchesInterval(chunk: LineChunk, start: number, end: number): boolean {
+  const empty = chunk.baseStart === chunk.baseEnd
+  if (empty) {
+    return chunk.baseStart >= start && chunk.baseStart <= end
+  }
+  return chunk.baseStart < end && chunk.baseEnd > start
+}
+
+function stringArraysEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
 function decodePathFromUrl(path: string): string {
   return path
     .split('/')
@@ -3406,6 +4085,11 @@ function createImageAssetName(extension: string): string {
           .toString(36)
           .slice(2, 10)}`
   return `${uuid}.${extension}`
+}
+
+function isShaConflictError(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error)
+  return text.includes('409')
 }
 
 function errorToMessage(error: unknown): string {

@@ -1,5 +1,6 @@
 import { type HTMLAttributes, useEffect, useRef, useState } from "react";
 import type { Editor as TiptapEditor } from "@tiptap/core";
+import { TextSelection } from "@tiptap/pm/state";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import { BubbleMenu } from "@tiptap/react/menus";
 import StarterKit from "@tiptap/starter-kit";
@@ -454,10 +455,21 @@ export function Editor({
       format === "markdown" ? value.trimEnd() !== current.trimEnd() : value !== current;
 
     if (hasChanged) {
+      const previousSelection = editor.state.selection;
+      const wasFocused = editor.isFocused;
       editor.commands.setContent(value || (format === "markdown" ? "" : "<p></p>"), {
         emitUpdate: false,
         contentType: format,
       });
+      if (wasFocused) {
+        const maxPos = editor.state.doc.content.size;
+        const nextFrom = Math.max(1, Math.min(previousSelection.from, maxPos));
+        const nextTo = Math.max(1, Math.min(previousSelection.to, maxPos));
+        const transaction = editor.state.tr.setSelection(
+          TextSelection.create(editor.state.doc, nextFrom, nextTo),
+        );
+        editor.view.dispatch(transaction);
+      }
       lastEmittedValueRef.current = value;
     }
   }, [editor, value, format]);
