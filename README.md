@@ -1,5 +1,7 @@
 # PullNotes
 
+https://github.com/user-attachments/assets/589c71d2-b95d-4003-9484-8e84356132e5
+
 Minimal Notion-style Markdown editor for GitHub repositories.
 
 ## Install (local)
