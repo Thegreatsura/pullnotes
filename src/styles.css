@@ -205,10 +205,6 @@ code {
   @apply leading-7 [&:not(:first-child)]:mt-4;
 }
 
-.cn-editor .tiptap hr {
-  @apply [&:not(:first-child)]:mt-4;
-}
-
 .cn-editor .tiptap ul {
   @apply my-4 ml-6 list-disc;
 }
@@ -217,13 +213,16 @@ code {
   @apply my-4 ml-6 list-decimal;
 }
 
-.cn-editor .tiptap li > ul,
-.cn-editor .tiptap li > ol {
-  @apply my-0;
+.cn-editor .tiptap blockquote {
+  @apply my-6 border-l-2 pl-6 italic;
 }
 
-.cn-editor .tiptap blockquote {
-  @apply mt-6 border-l-2 pl-6 italic;
+.cn-editor .tiptap img {
+  @apply my-4 transition-shadow;
+  
+  &.ProseMirror-selectednode {
+    @apply ring-1;
+  }
 }
 
 .cn-editor .tiptap a {
@@ -235,16 +234,11 @@ code {
 }
 
 .cn-editor .tiptap pre {
-  @apply my-4 overflow-x-auto rounded-xl bg-black/95 p-4 dark:bg-black;
+  @apply my-4 overflow-x-auto rounded-xl bg-background p-4;
 }
 
 .cn-editor .tiptap pre code {
-  @apply bg-transparent p-0 text-zinc-50 dark:text-zinc-50;
-}
-
-.cn-editor .tiptap pre::selection,
-.cn-editor .tiptap pre *::selection {
-  @apply bg-zinc-200 text-zinc-900;
+  @apply bg-transparent p-0;
 }
 
 .cn-editor .tiptap table {
@@ -271,5 +265,5 @@ code {
 
 .cn-editor .tiptap .selectedCell::selection,
 .cn-editor .tiptap .selectedCell *::selection {
-  @apply bg-accent text-foreground;
+  @apply bg-accent text-foreground!;
 }

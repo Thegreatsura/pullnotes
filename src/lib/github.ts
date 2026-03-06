@@ -19,7 +19,20 @@ type GitHubContentResponse = {
   sha: string
   content: string
   encoding: 'base64'
+  name?: string
+  path?: string
+  type?: 'file' | 'dir'
+  download_url?: string | null
 }
+
+type GitHubDirectoryContentResponse = Array<{
+  type: 'file' | 'dir'
+  name: string
+  path: string
+  sha: string
+  size?: number
+  download_url?: string | null
+}>
 
 type GitHubCommitResponse = Array<{
   sha: string
@@ -465,6 +478,93 @@ export async function upsertMarkdownFile(
       )
 
   return { sha: response.content.sha }
+}
+
+export async function upsertRepoFile(
+  targetInput: RepoTargetInput,
+  input: {
+    path: string
+    contentBase64: string
+    message: string
+    sha?: string
+  },
+  options?: {
+    userToken?: string
+  },
+): Promise<{ sha: string; path: string }> {
+  const target = normalizeTarget(targetInput)
+  const fullPath = joinWithRoot(target.rootPath, input.path)
+  const url = `https://api.github.com/repos/${target.owner}/${target.repo}/contents/${encodeURIComponent(fullPath)}`
+
+  const payload = {
+    message: input.message,
+    content: input.contentBase64,
+    branch: target.branch,
+    sha: input.sha,
+  }
+
+  const response = options?.userToken
+    ? await (async () => {
+        await getInstallationToken(target.owner, target.repo)
+        return githubRequestWithToken<{ content: { sha: string; path: string } }>(url, options.userToken, {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        })
+      })()
+    : await githubRequest<{ content: { sha: string; path: string } }>(
+        target,
+        `/repos/${target.owner}/${target.repo}/contents/${encodeURIComponent(fullPath)}`,
+        {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        },
+      )
+
+  return { sha: response.content.sha, path: response.content.path }
+}
+
+export async function getRepoVisibility(
+  input: RepoTargetInput,
+  options?: {
+    userToken?: string
+  },
+): Promise<{ private: boolean }> {
+  const target = normalizeTarget(input)
+  const path = `/repos/${target.owner}/${target.repo}`
+  const url = `https://api.github.com${path}`
+
+  const response = options?.userToken
+    ? await githubRequestWithToken<{ private: boolean }>(url, options.userToken)
+    : await githubRequest<{ private: boolean }>(target, path)
+
+  return { private: Boolean(response.private) }
+}
+
+export async function listRepoDirectoryDownloadUrls(
+  input: RepoTargetInput,
+  directoryPath: string,
+  options?: {
+    userToken?: string
+  },
+): Promise<Array<{ type: 'file' | 'dir'; name: string; path: string; downloadUrl: string | null }>> {
+  const target = normalizeTarget(input)
+  const cleanDirectoryPath = directoryPath.replace(/^\/+|\/+$/g, '')
+  const fullPath = joinWithRoot(target.rootPath, cleanDirectoryPath)
+  const path = `/repos/${target.owner}/${target.repo}/contents/${encodeURIComponent(fullPath)}?ref=${encodeURIComponent(target.branch)}`
+  const url = `https://api.github.com${path}`
+
+  const response = options?.userToken
+    ? await githubRequestWithToken<GitHubDirectoryContentResponse | GitHubContentResponse>(url, options.userToken)
+    : await githubRequest<GitHubDirectoryContentResponse | GitHubContentResponse>(target, path)
+
+  const list = Array.isArray(response) ? response : [response]
+
+  return list.map((item) => ({
+    type: item.type === 'dir' ? 'dir' : 'file',
+    name: item.name || '',
+    path: trimRoot(target.rootPath, item.path || ''),
+    downloadUrl: item.download_url || null,
+  }))
 }
 
 export async function deleteMarkdownFile(

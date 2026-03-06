@@ -1,5 +1,6 @@
 import { createFileRoute, useBlocker, useNavigate, useParams, useSearch } from '@tanstack/react-router'
 import { createServerFn, useServerFn } from '@tanstack/react-start'
+import type { Editor as TiptapEditor } from '@tiptap/core'
 import {
   Command,
   ChevronDown,
@@ -43,7 +44,7 @@ import {
   DropdownMenuTrigger,
 } from '#/components/ui/dropdown-menu'
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from '#/components/ui/empty'
-import { Editor } from '#/components/ui/editor'
+import { Editor, type EditorTocItem } from '#/components/ui/editor'
 import { Input } from '#/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '#/components/ui/popover'
 import { ScrollArea } from '#/components/ui/scroll-area'
@@ -70,11 +71,14 @@ import { authClient } from '#/lib/auth-client'
 import {
   deleteMarkdownFile,
   getMarkdownFile,
+  getRepoVisibility,
+  listRepoDirectoryDownloadUrls,
   listRecentCommits,
   listMarkdownEntriesViaGraphql,
   type RepoMarkdownMetaEntry,
   type RepoTargetInput,
   upsertMarkdownFile,
+  upsertRepoFile,
 } from '#/lib/github'
 import { parseMarkdownEntry, serializeMarkdownEntry } from '#/lib/markdown'
 import { requireGitHubAccessToken, requireSession } from '#/lib/session'
@@ -153,9 +157,10 @@ const ICON_OPTIONS: EmojiOption[] = [
   { unicode: '🌍', label: 'globe' },
   { unicode: '🏁', label: 'flag' },
 ]
-const COVER_RESULT_SKELETON_IDS = ['a', 'b', 'c', 'd', 'e', 'f']
+const COVER_RESULT_SKELETON_IDS = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
 const RECENT_REPOS_STORAGE_KEY = 'pullnotes.recent-repos'
 const MAX_RECENT_REPO_MENU_ITEMS = 5
+const IMAGE_ASSET_ROOT = '_files'
 
 const listFilesServerFn = createServerFn({ method: 'GET' })
   .inputValidator((input: { target: RepoTargetInput }) => input)
@@ -304,6 +309,58 @@ const searchPexelsServerFn = createServerFn({ method: 'GET' })
       .filter((item): item is CoverPhoto => Boolean(item))
   })
 
+const uploadImageAssetServerFn = createServerFn({ method: 'POST' })
+  .inputValidator((input: {
+    target: RepoTargetInput
+    fileName: string
+    mimeType: string
+    contentBase64: string
+  }) => input)
+  .handler(async ({ data }) => {
+    await requireSession()
+    const userToken = await requireGitHubAccessToken()
+
+    const normalizedName = sanitizeFileName(data.fileName)
+    const extension = getFileExtension(normalizedName)
+    const safeExt = extensionFromMimeType(data.mimeType) || extension || 'png'
+    const relativePath = `${IMAGE_ASSET_ROOT}/${createImageAssetName(safeExt)}`
+
+    const result = await upsertRepoFile(data.target, {
+      path: relativePath,
+      contentBase64: data.contentBase64,
+      message: `chore(pullnotes): upload ${relativePath}`,
+    }, {
+      userToken,
+    })
+
+    return {
+      path: result.path,
+      relativePath: normalizeStoredImagePath(relativePath),
+    }
+  })
+
+const repoVisibilityServerFn = createServerFn({ method: 'GET' })
+  .inputValidator((input: { target: RepoTargetInput }) => input)
+  .handler(async ({ data }) => {
+    await requireSession()
+    const userToken = await requireGitHubAccessToken()
+    return getRepoVisibility(data.target, { userToken })
+  })
+
+const listMediaDirectoryServerFn = createServerFn({ method: 'GET' })
+  .inputValidator((input: { target: RepoTargetInput; directoryPath: string }) => input)
+  .handler(async ({ data }) => {
+    await requireSession()
+    const userToken = await requireGitHubAccessToken()
+    const list = await listRepoDirectoryDownloadUrls(data.target, data.directoryPath, { userToken })
+    return list
+      .filter((item) => item.type === 'file')
+      .map((item) => ({
+        name: item.name,
+        url: item.downloadUrl,
+      }))
+  })
+
 export const Route = createFileRoute('/$owner/$repo/$branch')({
   validateSearch: (search): RouteSearch => {
     const raw = search as Record<string, unknown>
@@ -332,11 +389,15 @@ export function App() {
   const deleteFile = useServerFn(deleteFileServerFn)
   const getRecentCommits = useServerFn(recentCommitsServerFn)
   const searchPexels = useServerFn(searchPexelsServerFn)
+  const uploadImageAsset = useServerFn(uploadImageAssetServerFn)
+  const getRepoVisibilityFn = useServerFn(repoVisibilityServerFn)
+  const listMediaDirectory = useServerFn(listMediaDirectoryServerFn)
 
   const { data: authSession, isPending: authPending } = authClient.useSession()
   const titleInputRef = useRef<HTMLTextAreaElement>(null)
   const editorRegionRef = useRef<HTMLDivElement>(null)
   const isResolvingLeaveRef = useRef(false)
+  const imagePickerInputRef = useRef<HTMLInputElement | null>(null)
 
   const [files, setFiles] = useState<MarkdownFile[]>([])
   const [filterQuery, setFilterQuery] = useState('')
@@ -377,6 +438,34 @@ export function App() {
   const [highlightedPath, setHighlightedPath] = useState<string | null>(null)
   const [recentRepos, setRecentRepos] = useState<RecentRepoItem[]>([])
   const [isAboutOpen, setIsAboutOpen] = useState(false)
+  const [tocItems, setTocItems] = useState<EditorTocItem[]>([])
+  const [activeTocId, setActiveTocId] = useState<string | null>(null)
+  const [editorInstance, setEditorInstance] = useState<TiptapEditor | null>(null)
+  const [isRepoPrivate, setIsRepoPrivate] = useState(false)
+  const [bodyForEditor, setBodyForEditor] = useState('')
+  const [coverLayoutTick, setCoverLayoutTick] = useState(0)
+  const mediaDirectoryCacheRef = useRef(
+    new Map<string, { expiresAt: number; files: Map<string, string> }>(),
+  )
+  const mediaDirectoryRequestRef = useRef(new Map<string, Promise<Map<string, string>>>())
+  const latestDraftRef = useRef({
+    title: '',
+    icon: '',
+    cover: '',
+    body: '',
+  })
+  const [tocTop, setTocTop] = useState(96)
+  const [pendingImageUploads, setPendingImageUploads] = useState(0)
+  const [isSlashCommandOpen, setIsSlashCommandOpen] = useState(false)
+
+  useEffect(() => {
+    return () => {
+      if (imagePickerInputRef.current?.parentNode) {
+        imagePickerInputRef.current.parentNode.removeChild(imagePickerInputRef.current)
+      }
+      imagePickerInputRef.current = null
+    }
+  }, [])
 
   const owner = String(params.owner || '').trim()
   const repo = String(params.repo || '').trim()
@@ -391,6 +480,43 @@ export function App() {
       ? routeSearch.file.replace(/^\/+|\/+$/g, '').trim() || null
       : null
   const filePathFromUrl = filePathFromRoute || filePathFromSearch
+
+  useEffect(() => {
+    setTocItems([])
+    setActiveTocId(null)
+    setPendingImageUploads(0)
+    setIsSlashCommandOpen(false)
+  }, [selectedPath])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+
+    const update = () => {
+      const titleTop = titleInputRef.current?.getBoundingClientRect().top
+      if (typeof titleTop !== 'number' || Number.isNaN(titleTop)) return
+      const next = Math.max(12, Math.round(titleTop))
+      setTocTop((prev) => (Math.abs(prev - next) > 1 ? next : prev))
+    }
+
+    const raf = window.requestAnimationFrame(update)
+    const timeout = window.setTimeout(update, 60)
+    window.addEventListener('resize', update)
+
+    return () => {
+      window.cancelAnimationFrame(raf)
+      window.clearTimeout(timeout)
+      window.removeEventListener('resize', update)
+    }
+  }, [cover, selectedPath, isLoadingFile, hasLoadedFile, coverLayoutTick])
+
+  useEffect(() => {
+    latestDraftRef.current = {
+      title,
+      icon,
+      cover,
+      body,
+    }
+  }, [title, icon, cover, body])
 
   const activeTarget = useMemo(
     () => ({ owner, repo, branch, rootPath }),
@@ -416,11 +542,128 @@ export function App() {
 
   const tree = useMemo(() => buildTree(files), [files])
   const fileMap = useMemo(() => new Map(files.map((file) => [file.path, file])), [files])
+  const fileMapRef = useRef(fileMap)
+  useEffect(() => {
+    fileMapRef.current = fileMap
+  }, [fileMap])
   const isAuthenticated = Boolean(authSession?.user)
   const { theme, setTheme } = useTheme()
   const themeMode: ThemeMode =
     theme === 'dark' || theme === 'light' || theme === 'system' ? theme : 'system'
   const titleMissing = title.trim().length === 0
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      if (!isAuthenticated || !owner || !repo || !branch) return
+      try {
+        const info = await getRepoVisibilityFn({
+          data: {
+            target: activeTarget,
+          },
+        })
+        if (cancelled) return
+        setIsRepoPrivate(Boolean(info.private))
+      } catch {
+        if (cancelled) return
+        setIsRepoPrivate(false)
+      }
+    }
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [isAuthenticated, owner, repo, branch, activeTarget, getRepoVisibilityFn])
+
+  useEffect(() => {
+    let cancelled = false
+
+    const resolveDirectoryFileMap = async (directoryPath: string) => {
+      const key = directoryPath
+      const cached = mediaDirectoryCacheRef.current.get(key)
+      if (cached && cached.expiresAt > Date.now()) {
+        return cached.files
+      }
+
+      const pending = mediaDirectoryRequestRef.current.get(key)
+      if (pending) return pending
+
+      const request = (async () => {
+        const result = await listMediaDirectory({
+          data: {
+            target: activeTarget,
+            directoryPath,
+          },
+        })
+        const files = new Map<string, string>()
+        for (const item of result) {
+          if (!item.name || !item.url) continue
+          files.set(item.name, item.url)
+        }
+        mediaDirectoryCacheRef.current.set(key, {
+          expiresAt: Date.now() + 30_000,
+          files,
+        })
+        return files
+      })().finally(() => {
+        mediaDirectoryRequestRef.current.delete(key)
+      })
+
+      mediaDirectoryRequestRef.current.set(key, request)
+      return request
+    }
+
+    const resolveDisplayUrl = async (source: string): Promise<string> => {
+      if (isNonRelativeUrl(source)) return source
+      if (!isRepoPrivate) {
+        return toGitHubImageUrl({
+          owner,
+          repo,
+          branch,
+          rootPath,
+          relativePath: source,
+        })
+      }
+
+      const relativePath = source.replace(/^\/+/, '')
+      const filename = getFileName(relativePath)
+      if (!filename) return source
+      const directoryPath = getParentPath(relativePath)
+      const files = await resolveDirectoryFileMap(directoryPath)
+      return (
+        files.get(filename) ||
+        toGitHubImageUrl({
+          owner,
+          repo,
+          branch,
+          rootPath,
+          relativePath: source,
+        })
+      )
+    }
+
+    const build = async () => {
+      const sources = getImageSourcesInMarkdown(body).filter((source) => !isNonRelativeUrl(source))
+      if (!sources.length) {
+        if (!cancelled) setBodyForEditor(body)
+        return
+      }
+
+      const unique = Array.from(new Set(sources))
+      const resolved = await Promise.all(
+        unique.map(async (source) => [source, await resolveDisplayUrl(source)] as const),
+      )
+      if (cancelled) return
+
+      const map = new Map<string, string>(resolved)
+      setBodyForEditor(mapImageSourcesInMarkdown(body, (src) => map.get(src) || src))
+    }
+
+    void build()
+    return () => {
+      cancelled = true
+    }
+  }, [body, owner, repo, branch, rootPath, isRepoPrivate, activeTarget, listMediaDirectory])
   const filteredEmojiOptions = useMemo(() => {
     const query = emojiQuery.trim().toLowerCase()
     if (!query) return ICON_OPTIONS
@@ -506,6 +749,7 @@ export function App() {
   const canSave =
     Boolean(isAuthenticated) &&
     isSelectedFileLoaded &&
+    pendingImageUploads === 0 &&
     !isSaving &&
     !isLoadingRepo &&
     !titleMissing &&
@@ -561,8 +805,8 @@ export function App() {
   }, [selectedPath])
 
   const leaveBlocker = useBlocker({
-    shouldBlockFn: () => isDirty && !isSaving,
-    enableBeforeUnload: isDirty,
+    shouldBlockFn: () => (isDirty || pendingImageUploads > 0) && !isSaving,
+    enableBeforeUnload: isDirty || pendingImageUploads > 0,
     withResolver: true,
   })
 
@@ -706,7 +950,7 @@ export function App() {
   useEffect(() => {
     if (!selectedPath || !isAuthenticated) return
 
-    const expectedSha = fileMap.get(selectedPath)?.sha
+    const expectedSha = fileMapRef.current.get(selectedPath)?.sha
     const cached = readCachedMarkdownFile(activeTarget, selectedPath)
     const canUseCached = Boolean(cached && (!expectedSha || cached.sha === expectedSha))
     let cancelled = false
@@ -775,7 +1019,7 @@ export function App() {
     return () => {
       cancelled = true
     }
-  }, [selectedPath, getFile, isAuthenticated, activeTarget, fileMap])
+  }, [selectedPath, getFile, isAuthenticated, activeTarget])
 
   const focusEditor = () => {
     const editorEl = editorRegionRef.current?.querySelector('.ProseMirror') as HTMLElement | null
@@ -788,6 +1032,122 @@ export function App() {
     input.focus()
     const cursor = input.value.length
     input.setSelectionRange(cursor, cursor)
+  }
+
+  const readFileAsBase64 = (file: File) =>
+    new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onerror = () => reject(new Error('Failed to read image file.'))
+      reader.onload = () => {
+        const result = String(reader.result || '')
+        const content = result.replace(/^data:.*?;base64,/, '')
+        resolve(content)
+      }
+      reader.readAsDataURL(file)
+    })
+
+  const chooseImageFile = () =>
+    new Promise<File | null>((resolve) => {
+      let input = imagePickerInputRef.current
+      if (!input) {
+        input = document.createElement('input')
+        input.style.display = 'none'
+        document.body.appendChild(input)
+        imagePickerInputRef.current = input
+      }
+      input.type = 'file'
+      input.accept = 'image/*'
+      input.multiple = false
+      input.onchange = () => {
+        const file = input.files?.[0] || null
+        input.value = ''
+        resolve(file)
+      }
+      input.click()
+    })
+
+  const uploadImageToRepo = async (file: File) => {
+    const contentBase64 = await readFileAsBase64(file)
+    const uploaded = await uploadImageAsset({
+      data: {
+        target: activeTarget,
+        fileName: file.name || 'image.png',
+        mimeType: file.type || '',
+        contentBase64,
+      },
+    })
+
+    const relativePath = uploaded.relativePath
+    const defaultEditorPath = toGitHubImageUrl({
+      owner,
+      repo,
+      branch,
+      rootPath,
+      relativePath,
+    })
+
+    if (!isRepoPrivate) {
+      return {
+        relativePath,
+        editorPath: defaultEditorPath,
+      }
+    }
+
+    const directoryPath = getParentPath(relativePath)
+    mediaDirectoryCacheRef.current.delete(directoryPath)
+    mediaDirectoryRequestRef.current.delete(directoryPath)
+
+    try {
+      const list = await listMediaDirectory({
+        data: {
+          target: activeTarget,
+          directoryPath,
+        },
+      })
+      const byName = new Map<string, string>()
+      for (const item of list) {
+        if (!item.name || !item.url) continue
+        byName.set(item.name, item.url)
+      }
+
+      mediaDirectoryCacheRef.current.set(directoryPath, {
+        expiresAt: Date.now() + 30_000,
+        files: byName,
+      })
+
+      const filename = getFileName(relativePath)
+      const resolved = filename ? byName.get(filename) : null
+      return {
+        relativePath,
+        editorPath: resolved || defaultEditorPath,
+      }
+    } catch {
+      return {
+        relativePath,
+        editorPath: defaultEditorPath,
+      }
+    }
+  }
+
+  const mergeFirstBodyLineIntoTitle = () => {
+    const lines = body.split('\n')
+    const firstLine = lines[0] || ''
+    if (!firstLine) return
+
+    const remainingBody = lines.slice(1).join('\n')
+    const joinCursor = title.length
+    const nextTitle = `${title}${firstLine}`
+
+    setTitle(nextTitle)
+    setBody(remainingBody)
+    setHasUserEdits(true)
+
+    window.requestAnimationFrame(() => {
+      const input = titleInputRef.current
+      if (!input) return
+      input.focus()
+      input.setSelectionRange(joinCursor, joinCursor)
+    })
   }
 
   const handleSetCover = (nextCover: string) => {
@@ -827,7 +1187,8 @@ export function App() {
 
   const handleSave = async (options?: { silent?: boolean }): Promise<boolean> => {
     if (!selectedPath) return false
-    const cleanTitle = title.trim()
+    const draftAtStart = latestDraftRef.current
+    const cleanTitle = draftAtStart.title.trim()
     if (!cleanTitle) {
       setErrorMessage('Title is required.')
       return false
@@ -843,28 +1204,47 @@ export function App() {
           target: activeTarget,
           path: selectedPath,
           title: cleanTitle,
-          icon,
-          cover,
-          body,
+          icon: draftAtStart.icon,
+          cover: draftAtStart.cover,
+          body: draftAtStart.body,
           sha,
         },
       })
 
       setSha(result.sha)
-      setTitle(cleanTitle)
       setSavedTitle(cleanTitle)
-      setSavedIcon(icon)
-      setSavedCover(cover)
-      setSavedBody(body)
-      setHasUserEdits(false)
+      setSavedIcon(draftAtStart.icon)
+      setSavedCover(draftAtStart.cover)
+      setSavedBody(draftAtStart.body)
+      const latestDraft = latestDraftRef.current
+      const unchangedSinceSaveStart =
+        latestDraft.title.trim() === cleanTitle &&
+        latestDraft.icon.trim() === draftAtStart.icon.trim() &&
+        latestDraft.cover.trim() === draftAtStart.cover.trim() &&
+        normalizeBodyForCompare(latestDraft.body) === normalizeBodyForCompare(draftAtStart.body)
+      setHasUserEdits(!unchangedSinceSaveStart)
+
+      setFiles((previous) =>
+        previous.map((file) =>
+          file.path === selectedPath
+            ? {
+                ...file,
+                sha: result.sha,
+                title: cleanTitle,
+                icon: draftAtStart.icon,
+                cover: draftAtStart.cover,
+              }
+            : file,
+        ),
+      )
+
       writeCachedMarkdownFile(activeTarget, selectedPath, {
         sha: result.sha,
         title: cleanTitle,
-        icon,
-        cover,
-        body,
+        icon: draftAtStart.icon,
+        cover: draftAtStart.cover,
+        body: draftAtStart.body,
       })
-      await refreshFiles()
       await loadRecentCommits()
       if (toastId !== null) {
         toast.success('Saved', { id: toastId })
@@ -897,7 +1277,17 @@ export function App() {
   }
 
   const handleBodyChange = (nextBody: string) => {
-    setBody(nextBody)
+    const normalizedBody = mapImageSourcesInMarkdown(nextBody, (src) =>
+      fromRenderedImageUrl({
+        owner,
+        repo,
+        branch,
+        rootPath,
+        renderedPath: src,
+      }),
+    )
+
+    setBody(normalizedBody)
     const isEditorFocused =
       typeof document !== 'undefined' &&
       Boolean(editorRegionRef.current?.contains(document.activeElement))
@@ -927,14 +1317,14 @@ export function App() {
   }, [isAuthenticated, selectedPath, isSaving, isLoadingFile, isDirty, titleMissing, handleSave])
 
   useEffect(() => {
-    if (!canSave || isSaving) return
+    if (!canSave || isSaving || isSlashCommandOpen) return
 
     const timeout = setTimeout(() => {
       void handleSave({ silent: true })
     }, 3000)
 
     return () => clearTimeout(timeout)
-  }, [canSave, isSaving, handleSave])
+  }, [canSave, isSaving, isSlashCommandOpen, handleSave])
 
   useEffect(() => {
     if (leaveBlocker.status !== 'blocked' || isResolvingLeaveRef.current) return
@@ -948,8 +1338,20 @@ export function App() {
       }
 
       const shouldSave = window.confirm(
-        'You have unsaved changes. Press OK to save before leaving, or Cancel to leave without saving.',
+        pendingImageUploads > 0
+          ? 'Images are still uploading. Press OK to stay on this page, or Cancel to leave now.'
+          : 'You have unsaved changes. Press OK to save before leaving, or Cancel to leave without saving.',
       )
+
+      if (pendingImageUploads > 0) {
+        if (shouldSave) {
+          leaveBlocker.reset?.()
+        } else {
+          leaveBlocker.proceed?.()
+        }
+        isResolvingLeaveRef.current = false
+        return
+      }
 
       if (!shouldSave) {
         leaveBlocker.proceed?.()
@@ -962,7 +1364,7 @@ export function App() {
       else leaveBlocker.reset?.()
       isResolvingLeaveRef.current = false
     })()
-  }, [leaveBlocker, handleSave])
+  }, [leaveBlocker, handleSave, pendingImageUploads])
 
   const handleCreate = async () => {
     const nextTitle = window.prompt('Title')
@@ -1890,6 +2292,8 @@ export function App() {
                     <img
                       src={cover}
                       alt="Cover"
+                      onLoad={() => setCoverLayoutTick((value) => value + 1)}
+                      onError={() => setCoverLayoutTick((value) => value + 1)}
                       className="h-64 w-full object-cover"
                     />
                     <div className="absolute top-3 right-3 flex items-center gap-2 opacity-0 transition-opacity group-hover/cover:opacity-100">
@@ -2166,6 +2570,31 @@ export function App() {
                     onKeyDown={(event) => {
                       if (event.key === 'Enter') {
                         event.preventDefault()
+                        const input = event.currentTarget
+                        const selectionStart = input.selectionStart ?? title.length
+                        const selectionEnd = input.selectionEnd ?? selectionStart
+                        const nextTitle = title.slice(0, selectionStart)
+                        const movedToBody = title.slice(selectionEnd)
+                        const nextBody = movedToBody
+                          ? body
+                            ? `${movedToBody}\n${body}`
+                            : movedToBody
+                          : body
+
+                        if (nextTitle !== title || nextBody !== body) {
+                          setHasUserEdits(true)
+                        }
+
+                        setTitle(nextTitle)
+                        setBody(nextBody)
+
+                        window.requestAnimationFrame(() => {
+                          if (!editorInstance) {
+                            focusEditor()
+                            return
+                          }
+                          editorInstance.chain().focus().setTextSelection(1).run()
+                        })
                         return
                       }
                       if (event.key === 'ArrowDown') {
@@ -2190,12 +2619,89 @@ export function App() {
                       className="cn-editor h-full"
                       editorClassName="h-full min-h-full border-0 bg-transparent px-0 pt-2 pb-10 text-base leading-7 shadow-none focus-visible:ring-0 focus-visible:border-transparent"
                       format="markdown"
-                      value={body}
+                      value={bodyForEditor}
                       onChange={handleBodyChange}
                       onArrowUpAtStart={focusTitleInput}
+                      onBackspaceAtStart={mergeFirstBodyLineIntoTitle}
+                      enableImagePasteDrop
+                      onUploadImage={async (file) => {
+                        const uploaded = await uploadImageToRepo(file)
+                        return { src: uploaded.editorPath, alt: file.name || undefined }
+                      }}
+                      onRequestImage={async () => {
+                        const file = await chooseImageFile()
+                        if (!file) return null
+                        return {
+                          kind: 'file',
+                          file,
+                          ...(file.name ? { alt: file.name } : {}),
+                        } as const
+                      }}
+                      onPendingUploadsChange={setPendingImageUploads}
+                      onSlashCommandOpenChange={setIsSlashCommandOpen}
+                      onEditorReady={setEditorInstance}
+                      onTocChange={({ items, activeId }) => {
+                        setTocItems(items)
+                        setActiveTocId(activeId)
+                      }}
                     />
                   </div>
                 </div>
+
+                {tocItems.length > 1 ? (
+                  <div className="fixed right-6 z-30 hidden 2xl:block" style={{ top: `${tocTop}px` }}>
+                    <div className="group/toc relative">
+                      <div className="flex justify-end transition-opacity duration-200 group-hover/toc:opacity-0 group-focus-within/toc:opacity-0">
+                        <div className="flex flex-col items-end gap-3">
+                          {tocItems.map((item) => (
+                            <button
+                              key={`${item.id}-mini`}
+                              type="button"
+                              title={item.text}
+                              onClick={() => {
+                                if (!editorInstance) return
+                                editorInstance.chain().focus().setTextSelection(item.pos).run()
+                              }}
+                              className={`block h-0.5 rounded-full transition-colors ${
+                                item.level === 1 ? 'w-5' : item.level === 2 ? 'w-4' : 'w-3'
+                              } ${
+                                activeTocId === item.id
+                                  ? 'bg-foreground'
+                                  : 'bg-muted-foreground/45 hover:bg-muted-foreground/70'
+                              }`}
+                            />
+                          ))}
+                        </div>
+                      </div>
+
+                      <aside className="absolute top-0 right-0 z-10 max-h-[calc(100vh-4rem)] w-60 overflow-y-auto rounded-md border bg-background/90 p-3 opacity-0 shadow-sm backdrop-blur-sm transition-all duration-200 group-hover/toc:pointer-events-auto group-hover/toc:translate-x-0 group-hover/toc:opacity-100 group-focus-within/toc:pointer-events-auto group-focus-within/toc:translate-x-0 group-focus-within/toc:opacity-100 pointer-events-none translate-x-3">
+                        <div className="space-y-0.5">
+                          {tocItems.map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              onClick={() => {
+                                if (!editorInstance) return
+                                editorInstance.chain().focus().setTextSelection(item.pos).run()
+                              }}
+                              className={`truncate rounded-sm px-2 py-1 text-left text-xs transition-colors ${
+                                activeTocId === item.id
+                                  ? 'text-foreground'
+                                  : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground'
+                              }`}
+                              style={{
+                                marginLeft: `${Math.max(0, item.level - 2) * 10}px`,
+                                width: `calc(100% - ${Math.max(0, item.level - 2) * 10}px)`,
+                              }}
+                            >
+                              {item.text}
+                            </button>
+                          ))}
+                        </div>
+                      </aside>
+                    </div>
+                  </div>
+                ) : null}
               </div>
               </div>
             )}
@@ -2724,6 +3230,183 @@ function decodePathFromUrl(path: string): string {
       }
     })
     .join('/')
+}
+
+function mapImageSourcesInMarkdown(markdown: string, map: (src: string) => string): string {
+  let next = markdown
+
+  next = next.replace(/!\[([^\]]*)\]\(([^)\s]+)(\s+"[^"]*")?\)/g, (_, alt: string, src: string, title: string | undefined) => {
+    const mapped = map(src)
+    return `![${alt}](${mapped}${title || ''})`
+  })
+
+  next = next.replace(/<img[^>]*\s+src=(["'])([^"']+)\1[^>]*>/g, (full: string, quote: string, src: string) => {
+    const mapped = map(src)
+    return full.replace(`src=${quote}${src}${quote}`, `src=${quote}${mapped}${quote}`)
+  })
+
+  return next
+}
+
+function getImageSourcesInMarkdown(markdown: string): string[] {
+  const sources: string[] = []
+  const markdownRegex = /!\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g
+  const htmlRegex = /<img[^>]*\s+src=(["'])([^"']+)\1[^>]*>/g
+
+  for (const match of markdown.matchAll(markdownRegex)) {
+    if (match[1]) sources.push(match[1])
+  }
+  for (const match of markdown.matchAll(htmlRegex)) {
+    if (match[2]) sources.push(match[2])
+  }
+
+  return sources
+}
+
+function getFileName(path: string): string {
+  const trimmed = path.replace(/^\/+|\/+$/g, '')
+  if (!trimmed) return ''
+  const index = trimmed.lastIndexOf('/')
+  return index >= 0 ? trimmed.slice(index + 1) : trimmed
+}
+
+function getParentPath(path: string): string {
+  const trimmed = path.replace(/^\/+|\/+$/g, '')
+  if (!trimmed) return ''
+  const index = trimmed.lastIndexOf('/')
+  if (index <= 0) return ''
+  return trimmed.slice(0, index)
+}
+
+function toGitHubImageUrl(input: {
+  owner: string
+  repo: string
+  branch: string
+  rootPath: string
+  relativePath: string
+}): string {
+  const src = input.relativePath.trim()
+  if (!src) return src
+  if (isNonRelativeUrl(src)) return src
+
+  const relativePath = src.replace(/^\/+/, '')
+  if (!relativePath) return src
+  const rootPath = input.rootPath.replace(/^\/+|\/+$/g, '')
+  const repoPath = rootPath ? `${rootPath}/${relativePath}` : relativePath
+
+  return `https://raw.githubusercontent.com/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/${encodeURIComponent(input.branch)}/${encodeURI(repoPath)}`
+}
+
+function fromRenderedImageUrl(input: {
+  owner: string
+  repo: string
+  branch: string
+  rootPath: string
+  renderedPath: string
+}): string {
+  const src = input.renderedPath.trim()
+  if (!src) return src
+
+  const rawPrefix = `https://raw.githubusercontent.com/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/${encodeURIComponent(input.branch)}/`
+  const mediaPrefix = `https://media.githubusercontent.com/media/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/${encodeURIComponent(input.branch)}/`
+  if (src.startsWith(rawPrefix)) {
+    const [rawPath] = src.slice(rawPrefix.length).split('?')
+    return normalizeStoredImagePath(trimImageRootPath(decodePathFromUrl(rawPath), input.rootPath))
+  }
+  if (src.startsWith(mediaPrefix)) {
+    const [rawPath] = src.slice(mediaPrefix.length).split('?')
+    return normalizeStoredImagePath(trimImageRootPath(decodePathFromUrl(rawPath), input.rootPath))
+  }
+
+  const proxyPrefix = `/api/media/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/${encodeURIComponent(input.branch)}/`
+  if (src.startsWith(proxyPrefix)) {
+    const [encodedPath] = src.slice(proxyPrefix.length).split('?')
+    return decodePathFromUrl(encodedPath)
+  }
+
+  try {
+    const parsed = new URL(src)
+    if (parsed.href.startsWith(rawPrefix)) {
+      const [rawPath] = parsed.href.slice(rawPrefix.length).split('?')
+      return normalizeStoredImagePath(trimImageRootPath(decodePathFromUrl(rawPath), input.rootPath))
+    }
+    if (parsed.href.startsWith(mediaPrefix)) {
+      const [rawPath] = parsed.href.slice(mediaPrefix.length).split('?')
+      return normalizeStoredImagePath(trimImageRootPath(decodePathFromUrl(rawPath), input.rootPath))
+    }
+    if (parsed.pathname.startsWith(proxyPrefix)) {
+      const encodedPath = parsed.pathname.slice(proxyPrefix.length)
+      return decodePathFromUrl(encodedPath)
+    }
+  } catch {
+    // path is not an absolute URL
+  }
+
+  return src
+}
+
+function isNonRelativeUrl(src: string): boolean {
+  if (/^(https?:)?\/\//i.test(src)) return true
+  if (/^[a-z][a-z0-9+.-]*:/i.test(src)) return true
+  return false
+}
+
+function trimImageRootPath(path: string, rootPath: string): string {
+  const normalizedRoot = rootPath.replace(/^\/+|\/+$/g, '')
+  if (!normalizedRoot) return path
+  return path.startsWith(`${normalizedRoot}/`) ? path.slice(normalizedRoot.length + 1) : path
+}
+
+function normalizeStoredImagePath(path: string): string {
+  const trimmed = path.trim()
+  if (trimmed.startsWith('/')) return trimmed
+  if (trimmed.startsWith(`${IMAGE_ASSET_ROOT}/`)) {
+    return `/${trimmed}`
+  }
+  return trimmed
+}
+
+function sanitizeFileName(value: string): string {
+  const trimmed = value.trim().replace(/[/\\?%*:|"<>]/g, '-')
+  if (!trimmed) return 'image.png'
+  return trimmed
+}
+
+function getFileExtension(value: string): string {
+  const ext = value.split('.').pop()?.toLowerCase() || ''
+  if (!ext) return ''
+  if (!/^[a-z0-9]+$/.test(ext)) return ''
+  return ext
+}
+
+function extensionFromMimeType(value: string): string {
+  const mime = value.trim().toLowerCase()
+  switch (mime) {
+    case 'image/jpeg':
+      return 'jpg'
+    case 'image/png':
+      return 'png'
+    case 'image/webp':
+      return 'webp'
+    case 'image/gif':
+      return 'gif'
+    case 'image/svg+xml':
+      return 'svg'
+    case 'image/avif':
+      return 'avif'
+    default:
+      return ''
+  }
+}
+
+function createImageAssetName(extension: string): string {
+  const uuid =
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}-${Math.random()
+          .toString(36)
+          .slice(2, 10)}`
+  return `${uuid}.${extension}`
 }
 
 function errorToMessage(error: unknown): string {

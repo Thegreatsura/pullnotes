@@ -1,11 +1,42 @@
 import { Extension } from "@tiptap/core";
 import Suggestion from "@tiptap/suggestion";
-import suggestion from "./suggestion";
+import createSuggestion, {
+  type ImagePickerFileResult,
+  type ImagePickerHandler,
+  type ImagePickerContext,
+  type SlashImageFallback,
+} from "./suggestion";
 
-const SlashCommands = Extension.create({
+type SlashCommandsOptions = {
+  onRequestImage: ImagePickerHandler | null;
+  onInsertLocalImageFile: ((context: ImagePickerContext & Omit<ImagePickerFileResult, "kind">) => void | Promise<void>) | null;
+  enableImages: boolean;
+  imageSlashFallback: SlashImageFallback;
+  onMenuOpenChange: ((open: boolean) => void) | null;
+};
+
+const SlashCommands = Extension.create<SlashCommandsOptions>({
   name: "slash-commands",
 
+  addOptions() {
+    return {
+      onRequestImage: null,
+      onInsertLocalImageFile: null,
+      enableImages: true,
+      imageSlashFallback: "prompt-url",
+      onMenuOpenChange: null,
+    };
+  },
+
   addProseMirrorPlugins() {
+    const suggestion = createSuggestion({
+      onRequestImage: this.options.onRequestImage,
+      onInsertLocalImageFile: this.options.onInsertLocalImageFile,
+      enableImages: this.options.enableImages,
+      imageSlashFallback: this.options.imageSlashFallback,
+      onMenuOpenChange: this.options.onMenuOpenChange,
+    });
+
     return [
       Suggestion({
         editor: this.editor,
